@@ -14,7 +14,7 @@ import duckdb
 import polars as pl
 
 from .cohorts import WalletRecord, make_cohorts
-from .fills import FillArchive
+from .fills import ACCOUNTING_UNIT, FEE_POLICY, FEE_POLICY_EVIDENCE, FillArchive
 from .ledger import verify_transfers
 
 PILOT_CUTOFF = datetime(2026, 10, 23, tzinfo=timezone.utc)
@@ -227,6 +227,7 @@ def run_study(
         "First observed main-perpetual trade is left-censored by archive coverage, not true wallet inception.",
         "No observed link is not proof of independence, common ownership, or complete transfer coverage.",
         "Fee-adjusted realized fill PnL per $100 traded excludes funding and unrealized PnL; not total account or follower return.",
+        "Dollar amounts are nominal Hyperliquid contract dollars settled in USDC, not fiat-USD valuations; stablecoin depeg effects and external FX are not modeled.",
         "Equal-wallet weighting; descriptive normal interval, when available, is not cluster-aware or causal inference.",
         "Coverage intervals and retrieval identities are declared by the snapshot producer, not independently certified.",
     ]
@@ -299,7 +300,9 @@ def run_study(
                 "historical_availability_policy": "exclude explicitly later-known records",
                 "forward_outcome_policy": "event time regardless of later availability",
                 "historical_notional_policy": "positive notional required for trade evidence",
-                "fee_policy": "signed USD only; no implicit non-USD conversion",
+                "fee_policy": FEE_POLICY,
+                "accounting_unit": ACCOUNTING_UNIT,
+                "fee_policy_evidence": FEE_POLICY_EVIDENCE,
                 "fill_money_decimal_places": 12,
                 "weighting": "equal wallet",
             },

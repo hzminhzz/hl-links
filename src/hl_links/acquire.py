@@ -334,7 +334,7 @@ def acquire_snapshots(output_dir, fill_windows, ledger_windows, *, connection,
     pl.DataFrame(rows, schema=_LEDGER_SCHEMA).write_parquet(ledger_path)
     metadata = {
         "fills": _receipt("vike_primary_reservoir_fallback", fill_receipts, fill_intervals,
-                          fee_units=fee_units, fee_policy="USD only; original signed fee and token retained"),
+                          fee_units=fee_units, fee_policy="original signed fee and token retained; no conversion during acquisition"),
         "ledger": _receipt("vike_global_ledger", ledger_receipts, ledger_intervals,
                            min_usd=100, limit=page_limit, max_pages_per_window=max_pages,
                            intermediary_attribution="not available; two-sided ordinary sends only"),

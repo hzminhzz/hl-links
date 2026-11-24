@@ -9,6 +9,13 @@ _REQUIRED = {
     "wallet", "trade_id", "event_at", "known_at", "ingested_at", "dex_name",
     "symbol", "closed_pnl_usd", "fee_amount", "fee_unit", "notional_usd",
 }
+# Hyperliquid main-perp PnL settles in USDC at the contract's nominal dollar
+# value. The venue does not apply a USDC/USDT FX conversion. This is not an
+# assertion that USDC always trades at one fiat USD.
+ACCOUNTING_UNIT = "nominal Hyperliquid contract dollars (USDC settlement)"
+FEE_POLICY_EVIDENCE = "https://hyperliquid.gitbook.io/hyperliquid-docs/trading/contract-specifications"
+FEE_POLICY = "signed USD or native main-perp USDC fees; no external FX or implicit conversion of other tokens"
+
 _MAIN_PERP = """
     upper(trim(dex_name)) = 'HL' AND trim(symbol) <> ''
     AND NOT regexp_matches(symbol, '[@#/:]')
@@ -54,7 +61,7 @@ WITH params AS (
            count(*) OVER (PARTITION BY wallet, trade_id) AS variants,
            earlier_keys.trade_id IS NOT NULL AS cross_window_conflict,
            trade_id IS NULL OR trade_id = '' OR wallet IS NULL OR wallet = '' AS bad_key,
-           fee_unit IS DISTINCT FROM 'USD' OR fee IS NULL AS bad_fee,
+           fee_unit IS NULL OR fee_unit NOT IN ('USD', 'USDC') OR fee IS NULL AS bad_fee,
            pnl IS NULL AS bad_pnl,
            -- An observed historical trade must have positive notional.
            -- A zero-volume forward row cannot carry realized PnL or fees.
@@ -76,6 +83,7 @@ SELECT wallet, min(event_at) AS first_trade_at, max(event_at) AS last_trade_at,
        count(*) FILTER (WHERE known_at IS NULL) AS unknown_availability,
        count(*) FILTER (WHERE in_score) AS score_fills,
        count(*) FILTER (WHERE in_score AND bad_fee) AS unknown_fees,
+       count(*) FILTER (WHERE in_score AND fee_unit = 'USDC' AND NOT bad_fee) AS native_usdc_fee_fills,
        count(*) FILTER (WHERE in_score AND bad_pnl) AS invalid_pnl,
        count(*) FILTER (WHERE bad_notional) AS invalid_notional,
        coalesce(sum(pnl - fee) FILTER (
@@ -156,7 +164,7 @@ class FillArchive:
         """, [end, start, start, end, wallets, wallets]).fetchone()
         counters = (
             "observed_variants", "duplicate_rows", "conflicting_keys", "cross_window_conflicting_keys", "invalid_keys",
-            "unknown_availability", "score_fills", "unknown_fees", "invalid_pnl",
+            "unknown_availability", "score_fills", "unknown_fees", "native_usdc_fee_fills", "invalid_pnl",
             "invalid_notional",
         )
         details = {key: sum(row[key] for row in rows) for key in counters}

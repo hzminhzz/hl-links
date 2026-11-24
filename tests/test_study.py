@@ -238,6 +238,35 @@ def test_equal_wallet_weighting_rebates_unknown_fees_and_zero_volume(tmp_path):
     assert report["status"] == "partial"
 
 
+def test_native_usdc_main_perp_fees_preserve_net_profit_and_signed_rebates(tmp_path):
+    rows = [
+        dict(row, fee_unit=" usdc ") for row in base_fills()
+    ] + [
+        fill("y", 90, 1, pnl=0, fee=-2, notional=100, fee_unit="USDC"),
+        fill("under", 91, -70, fee_unit="USDC"),
+        fill("under", 92, -60, pnl=20_000, fee=1, fee_unit="USDC"),
+        fill("unknown", 93, -70, fee_unit="USDC"),
+        fill("unknown", 94, -60, pnl=30_000, fee=1, fee_unit="HYPE"),
+        fill("c", 95, 1, pnl=1_000_000, fee=-100, fee_unit="USDC", symbol="xyz:BTC"),
+    ]
+    report = snapshot(tmp_path, rows, transfer("tx", "pro", "y"))
+    assert report["cohorts"]["proven"] == ["pro"]  # net exactly 20,000
+    assert report["cohorts"]["linked"] == ["y"]
+    assert report["cohorts"]["no_observed_link"] == ["c"]
+    linked = report["comparison"]["linked"]
+    assert linked["wallet_scores"]["y"]["score"] == 6
+    assert report["comparison"]["no_observed_link"]["mean"] == -5
+    assert report["comparison"]["mean_difference"] == 11
+    diagnostics = report["manifest"]["diagnostics"]
+    assert diagnostics["historical_fills"]["unknown_fees"] == 1
+    assert diagnostics["forward_fills"]["unknown_fees"] == 0
+    assert diagnostics["forward_fills"]["native_usdc_fee_fills"] == 3
+    parameters = report["manifest"]["parameters"]
+    assert parameters["accounting_unit"] == "nominal Hyperliquid contract dollars (USDC settlement)"
+    assert parameters["fee_policy_evidence"] == "https://hyperliquid.gitbook.io/hyperliquid-docs/trading/contract-specifications"
+    assert any("depeg" in message for message in report["limitations"])
+
+
 @pytest.mark.parametrize(("pnl", "fee"), [(1000, 0), (0, -10), (10, 10)])
 def test_zero_notional_with_economic_values_invalidates_forward_score(tmp_path, pnl, fee):
     rows = base_fills() + [
