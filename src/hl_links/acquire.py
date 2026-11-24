@@ -14,6 +14,7 @@ import json
 import os
 from pathlib import Path
 import subprocess
+from tempfile import TemporaryDirectory
 from urllib.error import HTTPError, URLError
 from urllib.parse import urlencode
 from urllib.request import Request, urlopen
@@ -21,6 +22,12 @@ from urllib.request import Request, urlopen
 import duckdb
 import polars as pl
 
+from .fills import notional_matches_sql
+from .ledger import is_system_address
+from .resources import (
+    DEFAULT_MAX_SNAPSHOT_BYTES, GIB, SnapshotBudgetExceeded, configure_duckdb,
+    duckdb_budget, private_runs_dir, require_disk_headroom,
+)
 from .study import _utc
 
 _AGENT = "OpenAI File Downloader, XaiImageApiFetch/1.0"
@@ -92,8 +99,7 @@ def _archive_query(provider):
             'HL'::VARCHAR AS dex_name, upper(trim({symbol})) AS symbol,
             try_cast({pnl} AS DOUBLE) AS closed_pnl_usd,
             try_cast(fee AS DOUBLE) AS fee_amount, upper(trim(fee_token)) AS fee_unit,
-            CASE WHEN isfinite({qty}::DOUBLE) AND {qty} > 0
-                       AND isfinite(price::DOUBLE) AND price > 0
+            CASE WHEN {notional_matches_sql(qty, "price", notional)}
                        AND lower(trim(side)) IN ('buy','sell')
                  THEN try_cast({notional} AS DOUBLE) END AS notional_usd,
             lower(trim(side)) AS side, {qty}::DOUBLE AS quantity,
@@ -126,25 +132,41 @@ _LEDGER_SCHEMA = {
 def _read_slice(con, table, provider, archive, window):
     """A slice becomes visible only after a successful projected read."""
     uri, identity = archive(window.start.date().isoformat())
+    # The footer check is cheap and avoids accepting a truncated/replaced file
+    # just because its requested slice happens to contain some records.
+    raw_rows = con.execute("SELECT num_rows FROM parquet_file_metadata(?)", [uri]).fetchone()[0]
+    expected_rows = identity.get("rows")
+    if expected_rows is not None and raw_rows != expected_rows:
+        raise SourceUnavailable("archive_manifest_row_count_mismatch")
     captured = _now()
     con.execute(f"CREATE OR REPLACE TEMP TABLE {table} AS " + _archive_query(provider),
                 [captured, uri, window.start, window.end])
     # Capture completion, not a fabricated historical receipt.
     captured = _now()
     con.execute(f"UPDATE {table} SET ingested_at = ?", [captured])
-    count, invalid, duplicates = con.execute(
+    count, invalid, duplicates, invalid_rows = con.execute(
         f"SELECT count(*), count(*) FILTER (WHERE event_at IS NULL), "
-        f"coalesce(sum(source_rows - 1), 0) FROM {table}"
+        f"coalesce(sum(source_rows - 1), 0), "
+        f"count(*) FILTER (WHERE wallet IS NULL OR trade_id IS NULL OR trade_id = '' "
+        f"OR notional_usd IS NULL OR NOT coalesce(isfinite(closed_pnl_usd), false) "
+        f"OR NOT coalesce(isfinite(fee_amount), false) OR fee_unit IS NULL OR fee_unit = '') "
+        f"FROM {table}"
     ).fetchone()
+    conflicting_keys = con.execute(
+        f"SELECT count(*) FROM (SELECT wallet, trade_id FROM {table} GROUP BY ALL HAVING count(*) > 1)"
+    ).fetchone()[0]
     con.execute(f"ALTER TABLE {table} DROP COLUMN source_rows")
     return {"provider": provider, "window": window.pair(),
             "source_date": window.start.date().isoformat(), "identity": identity,
             "retrieved_at": captured.isoformat(), "rows": count,
-            "undated_rows": invalid, "duplicate_rows": duplicates}
+            "raw_file_rows": raw_rows, "undated_rows": invalid, "duplicate_rows": duplicates,
+            "invalid_rows": invalid_rows, "conflicting_keys": conflicting_keys}
 
 
 def _error(exc):
     # A DuckDB/HTTP exception may include a signed URL. Never persist its text.
+    if isinstance(exc, duckdb.OutOfMemoryException):
+        raise SnapshotBudgetExceeded("DuckDB memory or spill budget exceeded") from None
     return str(exc) if isinstance(exc, SourceUnavailable) else type(exc).__name__
 
 
@@ -200,7 +222,7 @@ def _ledger_row(item, captured):
     tx = item.get("hash")
     counterparty = item.get("counterparty")
     return {
-        "transaction_id": _hex_identifier(tx, 64),
+        "transaction_id": None if _hex_identifier(tx, 64) == "0x" + "0"*64 else _hex_identifier(tx, 64),
         "wallet": _address(item.get("wallet")),
         "counterparty": _address(counterparty),
         "direction": ("out" if amount < 0 else "in") if amount is not None else None,
@@ -208,7 +230,9 @@ def _ledger_row(item, captured):
         # Only ordinary sends with no contradictory counterparty field enter
         # direct matching. A two-sided match still cannot identify exchange
         # intermediaries or establish common ownership.
-        "intermediary": event_type != "send" or (counterparty is not None and _address(counterparty) is None),
+        "intermediary": (event_type != "send" or is_system_address(item.get("wallet"))
+                         or is_system_address(counterparty)
+                         or (counterparty is not None and _address(counterparty) is None)),
         "event_at": event_at, "known_at": None, "ingested_at": captured,
         "amount_usd": str(abs(amount).normalize()) if amount is not None else None,
         "source": "vike:global-ledger", "token": token.strip().upper() if isinstance(token, str) else None,
@@ -222,7 +246,8 @@ def _fetch_ledger(window, page, *, limit, max_pages, seen, rows):
     first_row = len(rows)
     receipt = {"window": window.pair(), "provider": "vike", "pages": 0,
                "raw_rows": 0, "duplicate_rows": 0, "out_of_window_rows": 0,
-               "retained_rows": 0, "complete": False}
+               "undated_rows": 0, "unexpected_out_of_window_rows": 0,
+               "retained_rows": 0, "pagination_exhausted": False, "complete": False}
     for _ in range(max_pages):
         try:
             params = {"start": window.start.isoformat(), "end": window.end.isoformat(),
@@ -241,13 +266,19 @@ def _fetch_ledger(window, page, *, limit, max_pages, seen, rows):
         receipt["raw_rows"] += len(items)
         receipt["retrieved_at"] = captured.isoformat()
         if not items:
-            receipt["complete"] = True
+            receipt["pagination_exhausted"] = True
             break
         for item in items:
             row = _ledger_row(item, captured)
             ts = row["event_at"]
-            if ts is not None and not window.start <= ts < window.end:
+            if ts is None:
+                receipt["undated_rows"] += 1
+            elif not window.start <= ts < window.end:
                 receipt["out_of_window_rows"] += 1
+                # An inclusive provider upper boundary is harmless; other
+                # out-of-window timestamps contradict the requested scope.
+                if ts != window.end:
+                    receipt["unexpected_out_of_window_rows"] += 1
                 continue
             key = tuple(v for k, v in row.items() if k != "ingested_at")
             if key in seen:
@@ -261,11 +292,64 @@ def _fetch_ledger(window, page, *, limit, max_pages, seen, rows):
             receipt["error"] = "missing_or_repeated_cursor"
             break
         cursors.add(cursor)
+    receipt["complete"] = receipt["pagination_exhausted"] and not (
+        receipt["undated_rows"] or receipt["unexpected_out_of_window_rows"]
+    )
     if not receipt["complete"]:
-        receipt.setdefault("error", "page_budget_exhausted")
+        receipt.setdefault("error", "ledger_timestamp_integrity_failure"
+                           if receipt["pagination_exhausted"] else "page_budget_exhausted")
     for row in rows[first_row:]:
         row["window_complete"] = receipt["complete"]
     return receipt
+
+
+def _covered_slice(receipt):
+    # An empty main-perp slice is not evidence of inactivity. Fall back and
+    # retain a coverage gap if neither source supplies trustworthy observations.
+    return receipt["rows"] > 0 and not any(
+        receipt[key] for key in ("undated_rows", "invalid_rows", "conflicting_keys")
+    )
+
+
+def _select_fill_slice(con, window, vike_archive, reservoir_archive, reconcile):
+    """Return exactly one authoritative slice; never union conflicting vendors."""
+    receipt = {"window": window.pair(), "attempts": []}
+    try:
+        primary = _read_slice(con, "primary_slice", "vike", vike_archive, window)
+    except (SourceUnavailable, OSError, TimeoutError, duckdb.Error) as exc:
+        receipt["attempts"].append({"provider": "vike", "error": _error(exc)})
+        primary = None
+    if primary is not None:
+        receipt["attempts"].append(primary)
+        receipt["selected_provider"] = "vike"
+        covered = _covered_slice(primary)
+        if not reconcile and covered:
+            return receipt, "primary_slice", covered
+        try:
+            check = _read_slice(con, "check_slice", "reservoir", reservoir_archive, window)
+            differences = _reconcile(con)
+            receipt["reconciliation"] = {"source": check, **differences}
+            if (_covered_slice(check) and differences["reservoir_only"]
+                    and not differences["vike_only"] and not differences["economic_discrepancies"]):
+                receipt["selected_provider"] = "reservoir"
+                receipt["selection_reason"] = "clean_reservoir_superset"
+                return receipt, "check_slice", True
+            if not _covered_slice(check) or any(differences[k] for k in (
+                "vike_only", "reservoir_only", "economic_discrepancies",
+            )):
+                covered = False
+        except (SourceUnavailable, OSError, TimeoutError, duckdb.Error) as exc:
+            receipt["reconciliation"] = {"error": _error(exc)}
+        return receipt, "primary_slice", covered
+    try:
+        fallback = _read_slice(con, "primary_slice", "reservoir", reservoir_archive, window)
+    except (SourceUnavailable, OSError, TimeoutError, duckdb.Error) as exc:
+        receipt["attempts"].append({"provider": "reservoir", "error": _error(exc)})
+        return receipt, None, False
+    receipt["attempts"].append(fallback)
+    receipt["selected_provider"] = "reservoir"
+    receipt["selection_reason"] = "primary_unavailable"
+    return receipt, "primary_slice", _covered_slice(fallback)
 
 
 def _receipt(source, slices, intervals, **details):
@@ -275,9 +359,54 @@ def _receipt(source, slices, intervals, **details):
             "acquisition": acquisition}
 
 
+class _SnapshotStager:
+    """Bound compressed staging by bytes; publish one Parquet per input kind."""
+
+    def __init__(self, root, output, max_bytes):
+        self.root = Path(root)
+        self.output = output
+        self.max_bytes = max_bytes
+        self.bytes = 0
+        self.parts = {"fills": [], "ledger": []}
+        self.published_bytes = 0
+
+    def add(self, kind, write):
+        require_disk_headroom(self.output)
+        path = self.root / f"{kind}-{len(self.parts[kind]):04d}.parquet"
+        write(path)
+        path.chmod(0o600)
+        self.bytes += path.stat().st_size
+        if self.bytes > self.max_bytes:
+            raise SnapshotBudgetExceeded("private snapshot byte budget exceeded")
+        require_disk_headroom(self.output)
+        self.parts[kind].append(path)
+
+    def publish(self, con, kind):
+        paths = self.parts[kind]
+        destination = self.output / f"{kind}.parquet"
+        if len(paths) == 1:
+            paths[0].replace(destination)
+        else:
+            # Stream the bounded partitions; do not accumulate all fill rows
+            # or ledger pages in one temporary table.
+            require_disk_headroom(self.output, sum(p.stat().st_size for p in paths))
+            con.read_parquet([str(p) for p in paths]).write_parquet(
+                str(destination), compression="zstd",
+            )
+            for path in paths:
+                path.unlink()
+        destination.chmod(0o600)
+        self.published_bytes += destination.stat().st_size
+        if self.published_bytes > self.max_bytes:
+            raise SnapshotBudgetExceeded("private snapshot byte budget exceeded")
+        require_disk_headroom(self.output)
+        return destination
+
+
 def acquire_snapshots(output_dir, fill_windows, ledger_windows, *, connection,
                       vike_archive, reservoir_archive, ledger_page,
-                      reconcile=False, page_limit=5000, max_pages=1000):
+                      reconcile=False, page_limit=5000, max_pages=100,
+                      max_snapshot_bytes=DEFAULT_MAX_SNAPSHOT_BYTES):
     """Public acquisition seam. External callbacks resolve source files/pages.
 
     Only successfully scanned intervals or exhausted ledger windows declare
@@ -285,59 +414,67 @@ def acquire_snapshots(output_dir, fill_windows, ledger_windows, *, connection,
     """
     if not 1 <= page_limit <= 5000 or max_pages < 1:
         raise ValueError("Invalid pagination budget")
+    if not isinstance(max_snapshot_bytes, int) or max_snapshot_bytes < 1:
+        raise ValueError("Invalid snapshot byte budget")
     output_dir = Path(output_dir)
     output_dir.mkdir(mode=0o700, parents=True, exist_ok=False)
     con = connection
-    con.execute("SET TimeZone = 'UTC'")
-    con.execute(f"CREATE OR REPLACE TEMP TABLE acquired_fills ({_FILL_SCHEMA})")
+    configure_duckdb(con, output_dir / ".spill")
     fill_receipts, fill_intervals = [], []
-    for window in _windows(fill_windows, daily=True):
-        receipt = {"window": window.pair(), "attempts": []}
-        for provider, archive in (("vike", vike_archive), ("reservoir", reservoir_archive)):
-            try:
-                result = _read_slice(con, "primary_slice", provider, archive, window)
-            except (SourceUnavailable, OSError, TimeoutError, duckdb.Error) as exc:
-                receipt["attempts"].append({"provider": provider, "error": _error(exc)})
-                continue
-            receipt["attempts"].append(result)
-            receipt["selected_provider"] = provider
-            con.execute("INSERT INTO acquired_fills SELECT * FROM primary_slice")
-            covered = not result["undated_rows"]
-            if reconcile and provider == "vike":
-                try:
-                    check = _read_slice(con, "check_slice", "reservoir", reservoir_archive, window)
-                    differences = _reconcile(con)
-                    receipt["reconciliation"] = {"source": check, **differences}
-                    if check["undated_rows"] or any(differences[k] for k in (
-                        "vike_only", "reservoir_only", "economic_discrepancies",
-                    )):
-                        covered = False
-                except (SourceUnavailable, OSError, TimeoutError, duckdb.Error) as exc:
-                    receipt["reconciliation"] = {"error": _error(exc)}
+    ledger_receipts, ledger_intervals = [], []
+    with TemporaryDirectory(prefix=".staging-", dir=output_dir) as staging:
+        stager = _SnapshotStager(staging, output_dir, max_snapshot_bytes)
+        for window in _windows(fill_windows, daily=True):
+            require_disk_headroom(output_dir, 12 * GIB)
+            receipt, table, covered = _select_fill_slice(
+                con, window, vike_archive, reservoir_archive, reconcile,
+            )
+            if table is not None:
+                stager.add("fills", lambda path: con.execute(
+                    f"COPY {table} TO ? (FORMAT PARQUET, COMPRESSION ZSTD)", [str(path)],
+                ))
+            for name in ("primary_slice", "check_slice"):
+                con.execute(f"DROP TABLE IF EXISTS {name}")
             if covered:
                 fill_intervals.append(window.pair())
-            break
-        fill_receipts.append(receipt)
-    fills_path = output_dir / "fills.parquet"
-    con.execute("COPY acquired_fills TO ? (FORMAT PARQUET, COMPRESSION ZSTD)", [str(fills_path)])
+            receipt["coverage_complete"] = covered
+            fill_receipts.append(receipt)
+        if not stager.parts["fills"]:
+            con.execute(f"CREATE TEMP TABLE empty_fills ({_FILL_SCHEMA})")
+            stager.add("fills", lambda path: con.execute(
+                "COPY empty_fills TO ? (FORMAT PARQUET, COMPRESSION ZSTD)", [str(path)],
+            ))
+            con.execute("DROP TABLE empty_fills")
+        # UTC daily windows bound both cursor pagination and Python row memory.
+        # Valid event times cannot overlap between these windows.
+        for window in _windows(ledger_windows, daily=True):
+            rows = []
+            receipt = _fetch_ledger(window, ledger_page, limit=page_limit, max_pages=max_pages,
+                                    seen=set(), rows=rows)
+            ledger_receipts.append(receipt)
+            if receipt["complete"]:
+                ledger_intervals.append(window.pair())
+            if rows:
+                stager.add("ledger", lambda path: pl.DataFrame(
+                    rows, schema=_LEDGER_SCHEMA,
+                ).write_parquet(path))
+        if not stager.parts["ledger"]:
+            stager.add("ledger", lambda path: pl.DataFrame(schema=_LEDGER_SCHEMA).write_parquet(path))
+        fills_path = stager.publish(con, "fills")
+        ledger_path = stager.publish(con, "ledger")
+        resource_budget = {**duckdb_budget(), "max_snapshot_bytes": max_snapshot_bytes,
+                           "staged_bytes": stager.bytes, "published_bytes": stager.published_bytes}
     fee_units = {str(unit): count for unit, count in con.execute(
-        "SELECT fee_unit, count(*) FROM acquired_fills GROUP BY fee_unit ORDER BY fee_unit"
+        "SELECT fee_unit, count(*) FROM read_parquet(?) GROUP BY fee_unit ORDER BY fee_unit",
+        [str(fills_path)],
     ).fetchall()}
-    ledger_receipts, ledger_intervals, rows, seen = [], [], [], set()
-    for window in _windows(ledger_windows, daily=False):
-        receipt = _fetch_ledger(window, ledger_page, limit=page_limit, max_pages=max_pages,
-                                seen=seen, rows=rows)
-        ledger_receipts.append(receipt)
-        if receipt["complete"]:
-            ledger_intervals.append(window.pair())
-    ledger_path = output_dir / "ledger.parquet"
-    pl.DataFrame(rows, schema=_LEDGER_SCHEMA).write_parquet(ledger_path)
     metadata = {
         "fills": _receipt("vike_primary_reservoir_fallback", fill_receipts, fill_intervals,
-                          fee_units=fee_units, fee_policy="original signed fee and token retained; no conversion during acquisition"),
+                          fee_units=fee_units, resource_budget=resource_budget,
+                          fee_policy="original signed fee and token retained; no conversion during acquisition"),
         "ledger": _receipt("vike_global_ledger", ledger_receipts, ledger_intervals,
                            min_usd=100, limit=page_limit, max_pages_per_window=max_pages,
-                           intermediary_attribution="not available; two-sided ordinary sends only"),
+                           intermediary_attribution="documented system addresses excluded; other intermediary attribution unavailable"),
     }
     metadata_path = output_dir / "metadata.json"
     metadata_path.write_text(json.dumps(metadata, indent=2, sort_keys=True) + "\n")
@@ -430,13 +567,13 @@ def main(argv=None):
     parser.add_argument("--reservoir-profile", default="reservoir")
     parser.add_argument("--reconcile", action="store_true")
     parser.add_argument("--page-limit", type=int, default=5000)
-    parser.add_argument("--max-pages", type=int, default=1000)
+    parser.add_argument("--max-pages", type=int, default=100, help="Per UTC ledger day")
+    parser.add_argument("--max-snapshot-gib", type=int, default=DEFAULT_MAX_SNAPSHOT_BYTES // GIB)
     args = parser.parse_args(argv)
-    private_root = Path(__file__).resolve().parents[2] / "runs"
+    private_root = private_runs_dir()
     output = args.output_dir.resolve()
     if output == private_root or not output.is_relative_to(private_root) or output.exists():
         parser.error("--output-dir must be a new directory inside runs/")
-    private_root.mkdir(mode=0o700, exist_ok=True)
     con = duckdb.connect(":memory:", config={"custom_user_agent": _AGENT})
     try:
         con.execute("SET extension_directory = ?", [str(private_root / "duckdb_extensions")])
@@ -448,7 +585,8 @@ def main(argv=None):
         acquire_snapshots(output, args.fill_window, args.ledger_window, connection=con,
                           vike_archive=vike.archive, reservoir_archive=reservoir.archive,
                           ledger_page=vike.ledger, reconcile=args.reconcile,
-                          page_limit=args.page_limit, max_pages=args.max_pages)
+                          page_limit=args.page_limit, max_pages=args.max_pages,
+                          max_snapshot_bytes=args.max_snapshot_gib * GIB)
     finally:
         con.close()
     return 0

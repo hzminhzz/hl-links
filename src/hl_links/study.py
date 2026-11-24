@@ -265,7 +265,7 @@ def run_study(
     if ledger_counts["unknown_availability_rows"]:
         limitations.append("Ledger availability is unknown for some historical evidence.")
     if ledger_counts["incomplete_window_rows"]:
-        limitations.append("Unexhausted ledger windows cannot establish verified transfers.")
+        limitations.append("Unexhausted or timestamp-invalid ledger windows cannot establish verified transfers.")
         partial = True
     if any(ledger_counts[key] for key in ("one_sided", "ambiguous", "incompatible", "invalid_rows", "late_known_rows")):
         limitations.append("Some ledger events are missing a side, incompatible, ambiguous, invalid or later-known; no qualifying edge inferred.")

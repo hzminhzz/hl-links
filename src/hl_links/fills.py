@@ -2,8 +2,11 @@
 
 from datetime import datetime
 from pathlib import Path
+from tempfile import TemporaryDirectory
 
 import duckdb
+
+from .resources import configure_duckdb, private_runs_dir
 
 _REQUIRED = {
     "wallet", "trade_id", "event_at", "known_at", "ingested_at", "dex_name",
@@ -15,6 +18,23 @@ _REQUIRED = {
 ACCOUNTING_UNIT = "nominal Hyperliquid contract dollars (USDC settlement)"
 FEE_POLICY_EVIDENCE = "https://hyperliquid.gitbook.io/hyperliquid-docs/trading/contract-specifications"
 FEE_POLICY = "signed USD or native main-perp USDC fees; no external FX or implicit conversion of other tokens"
+
+# Cross-provider monetary values can differ by float rounding only.
+NOTIONAL_ABS_TOLERANCE = 1e-8
+NOTIONAL_REL_TOLERANCE = 1e-9
+_EXECUTION_FIELDS = {"side", "quantity", "price"}
+
+
+def notional_matches_sql(quantity, price, notional):
+    q, p, n = (f"try_cast(({expr}) AS DOUBLE)" for expr in (quantity, price, notional))
+    product = f"({q} * {p})"
+    return f"""(
+        isfinite({q}) AND {q} > 0 AND isfinite({p}) AND {p} > 0
+        AND isfinite({product}) AND isfinite({n}) AND {n} > 0
+        AND abs({n} - {product}) <= greatest({NOTIONAL_ABS_TOLERANCE},
+            {NOTIONAL_REL_TOLERANCE} * greatest(abs({n}), abs({product})))
+    )"""
+
 
 _MAIN_PERP = """
     upper(trim(dex_name)) = 'HL' AND trim(symbol) <> ''
@@ -36,7 +56,9 @@ WITH params AS (
            try_cast(closed_pnl_usd AS DECIMAL(38,12)) AS pnl,
            try_cast(fee_amount AS DECIMAL(38,12)) AS fee,
            upper(trim(fee_unit)) AS fee_unit,
-           try_cast(notional_usd AS DECIMAL(38,12)) AS notional
+           try_cast(notional_usd AS DECIMAL(38,12)) AS notional,
+           lower(trim(side)) AS side, try_cast(quantity AS DOUBLE) AS quantity,
+           try_cast(price AS DOUBLE) AS price, has_execution
     FROM fill_input, params
     WHERE (start_at IS NULL OR event_at >= start_at) AND event_at < end_at
       -- Historical eligibility is availability-bounded. Retrospective outcomes
@@ -46,10 +68,12 @@ WITH params AS (
       AND (wallets IS NULL OR list_contains(wallets, {_WALLET}))
 ), variants AS (
     SELECT wallet, trade_id, event_at, symbol, pnl, fee, fee_unit, notional,
+           side, quantity, price, has_execution,
            min(known_at) AS known_at, min(ingested_at) AS first_ingested_at,
            max(ingested_at) AS last_ingested_at, count(*) AS raw_count
     FROM visible
-    GROUP BY wallet, trade_id, event_at, symbol, pnl, fee, fee_unit, notional
+    GROUP BY wallet, trade_id, event_at, symbol, pnl, fee, fee_unit, notional,
+             side, quantity, price, has_execution
 ), earlier_keys AS (
     SELECT DISTINCT {_WALLET} AS wallet, trim(trade_id::VARCHAR) AS trade_id
     FROM fill_input, params
@@ -67,6 +91,9 @@ WITH params AS (
            -- A zero-volume forward row cannot carry realized PnL or fees.
            notional IS NULL OR notional < 0
                OR (notional = 0 AND (start_at IS NULL OR pnl <> 0 OR fee <> 0))
+               OR (has_execution AND NOT coalesce(
+                   side IN ('buy','sell') AND {notional_matches_sql("quantity", "price", "notional")},
+                   false))
                AS bad_notional,
            event_at >= score_start AS in_score
     FROM variants LEFT JOIN earlier_keys USING (wallet, trade_id), params
@@ -103,13 +130,15 @@ class FillArchive:
     """One read-only snapshot; historical and forward queries have separate bounds."""
 
     def __init__(self, path: Path):
-        self.connection = duckdb.connect(":memory:")
+        self._spill = TemporaryDirectory(prefix=".study-spill-", dir=private_runs_dir())
+        self.connection = None
         try:
-            self.connection.execute("SET TimeZone = 'UTC'")
-            self.connection.read_parquet(str(path)).create_view("fill_input")
+            self.connection = duckdb.connect(":memory:")
+            configure_duckdb(self.connection, self._spill.name)
+            self.connection.read_parquet(str(path)).create_view("raw_fill_input")
             schema = dict(
                 (name, dtype)
-                for name, dtype, *_ in self.connection.execute("DESCRIBE fill_input").fetchall()
+                for name, dtype, *_ in self.connection.execute("DESCRIBE raw_fill_input").fetchall()
             )
             missing = _REQUIRED - schema.keys()
             if missing:
@@ -117,12 +146,26 @@ class FillArchive:
             for field in ("event_at", "known_at", "ingested_at"):
                 if schema[field] != "TIMESTAMP WITH TIME ZONE":
                     raise ValueError(f"Fill {field} must be timezone-aware")
+            execution = _EXECUTION_FIELDS & schema.keys()
+            if execution and execution != _EXECUTION_FIELDS:
+                raise ValueError("Execution fields must be supplied together: side, quantity, price")
+            projection = ", ".join(sorted(_REQUIRED))
+            if execution:
+                extras = "side, quantity, price, true AS has_execution"
+            else:
+                # T01 normalized fixture contract remains supported.
+                extras = "NULL::VARCHAR AS side, NULL::DOUBLE AS quantity, NULL::DOUBLE AS price, false AS has_execution"
+            self.connection.execute(f"CREATE VIEW fill_input AS SELECT {projection}, {extras} FROM raw_fill_input")
         except BaseException:
             self.close()
             raise
 
     def close(self):
-        self.connection.close()
+        try:
+            if self.connection is not None:
+                self.connection.close()
+        finally:
+            self._spill.cleanup()
 
     def __enter__(self):
         return self

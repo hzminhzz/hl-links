@@ -2,6 +2,7 @@ from datetime import datetime, timezone
 
 import duckdb
 import polars as pl
+import pytest
 
 from hl_links.acquire import SourceUnavailable, Window, acquire_snapshots
 from hl_links.study import run_study
@@ -177,6 +178,146 @@ def test_reconciliation_reports_discrepancies_without_union(tmp_path):
     assert set(data["source"]) == {"vike"}
 
 
+@pytest.mark.parametrize("primary_has_rows", [False, True])
+def test_missing_primary_slice_recovers_clean_reservoir_superset(tmp_path, primary_has_rows):
+    vike, reservoir = tmp_path / "vike.parquet", tmp_path / "reservoir.parquet"
+    vike_file(vike, [fill()] if primary_has_rows else [])
+    reservoir_file(reservoir, [reservoir_fill(), reservoir_fill(trade_id=2)])
+    window = Window(utc("2026-10-07T00:00:00Z"), utc("2026-10-07T00:00:05Z"))
+    out = tmp_path / "recover"
+    with duckdb.connect() as connection:
+        metadata = acquire_snapshots(
+            out, [window], [], connection=connection,
+            vike_archive=lambda day: (str(vike), {"date": day}),
+            reservoir_archive=lambda day: (str(reservoir), {"date": day}),
+            ledger_page=lambda **_: {"items": []}, reconcile=primary_has_rows,
+        )
+    receipt = metadata["fills"]["acquisition"]["slices"][0]
+    assert receipt["selected_provider"] == "reservoir"
+    assert receipt["reconciliation"]["reservoir_only"] == (1 if primary_has_rows else 2)
+    assert metadata["fills"]["intervals"] == [window.pair()]
+    rows = pl.read_parquet(out / "fills.parquet")
+    assert sorted(rows["trade_id"]) == ["1", "2"]
+    assert set(rows["source"]) == {"reservoir"}
+
+
+def test_empty_primary_without_confirmed_fallback_is_a_coverage_gap(tmp_path):
+    vike = tmp_path / "vike.parquet"
+    vike_file(vike, [])
+    window = Window(utc("2026-10-07T00:00:00Z"), utc("2026-10-07T00:00:05Z"))
+    out = tmp_path / "gap"
+    with duckdb.connect() as connection:
+        metadata = acquire_snapshots(
+            out, [window], [], connection=connection,
+            vike_archive=lambda day: (str(vike), {"date": day}),
+            reservoir_archive=unavailable, ledger_page=lambda **_: {"items": []},
+        )
+    assert metadata["fills"]["intervals"] == []
+    assert metadata["fills"]["acquisition"]["slices"][0]["reconciliation"]["error"] == "missing_archive"
+    assert pl.read_parquet(out / "fills.parquet").height == 0
+
+
+def test_archive_row_count_mismatch_uses_reservoir(tmp_path):
+    vike, reservoir = tmp_path / "vike.parquet", tmp_path / "reservoir.parquet"
+    vike_file(vike, [fill()])
+    reservoir_file(reservoir, [reservoir_fill(), reservoir_fill(trade_id=2)])
+    window = Window(utc("2026-10-07T00:00:00Z"), utc("2026-10-07T00:00:05Z"))
+    out = tmp_path / "truncated"
+    with duckdb.connect() as connection:
+        metadata = acquire_snapshots(
+            out, [window], [], connection=connection,
+            vike_archive=lambda day: (str(vike), {"date": day, "rows": 2}),
+            reservoir_archive=lambda day: (str(reservoir), {"date": day}),
+            ledger_page=lambda **_: {"items": []},
+        )
+    receipt = metadata["fills"]["acquisition"]["slices"][0]
+    assert receipt["attempts"][0]["error"] == "archive_manifest_row_count_mismatch"
+    assert receipt["selected_provider"] == "reservoir"
+    assert metadata["fills"]["intervals"] == [window.pair()]
+    assert pl.read_parquet(out / "fills.parquet").height == 2
+
+
+def test_execution_conflicts_are_not_exact_duplicates(tmp_path):
+    vike = tmp_path / "vike.parquet"
+    vike_file(vike, [fill(), fill(side="sell", size_token=1.0, price=200.0)])
+    window = Window(utc("2026-10-07T00:00:00Z"), utc("2026-10-07T00:00:05Z"))
+    out = tmp_path / "execution-conflict"
+    with duckdb.connect() as connection:
+        metadata = acquire_snapshots(
+            out, [window], [], connection=connection,
+            vike_archive=lambda day: (str(vike), {"date": day}),
+            reservoir_archive=unavailable, ledger_page=lambda **_: {"items": []},
+        )
+    report = run_study(out / "fills.parquet", out / "ledger.parquet", metadata)
+    counts = report["manifest"]["diagnostics"]["historical_fills"]
+    assert counts["conflicting_keys"] == 1
+    assert counts["duplicate_rows"] == 0
+
+
+def test_inconsistent_reported_notional_is_not_usable(tmp_path):
+    vike = tmp_path / "vike.parquet"
+    vike_file(vike, [
+        fill(trade_id=1, size_usd=20_000.0),
+        fill(trade_id=2, wallet="0x" + "b"*40, size_usd=200.00000001),
+        fill(trade_id=3, wallet="0x" + "c"*40, size_usd=float("inf")),
+    ])
+    window = Window(utc("2026-10-07T00:00:00Z"), utc("2026-10-07T00:00:05Z"))
+    out = tmp_path / "notional"
+    with duckdb.connect() as connection:
+        metadata = acquire_snapshots(
+            out, [window], [], connection=connection,
+            vike_archive=lambda day: (str(vike), {"date": day}),
+            reservoir_archive=unavailable, ledger_page=lambda **_: {"items": []},
+        )
+    data = pl.read_parquet(out / "fills.parquet").sort("trade_id")
+    assert data["notional_usd"].to_list() == [None, 200.00000001, None]
+    assert metadata["fills"]["intervals"] == []
+    report = run_study(out / "fills.parquet", out / "ledger.parquet", metadata)
+    assert report["manifest"]["diagnostics"]["historical_fills"]["invalid_notional"] == 2
+
+
+def test_acquisition_has_private_spill_and_explicit_resource_budget(tmp_path):
+    day = tmp_path / "day.parquet"
+    vike_file(day, [fill()])
+    window = Window(utc("2026-10-07T00:00:00Z"), utc("2026-10-07T00:00:05Z"))
+    out = tmp_path / "bounded"
+    with duckdb.connect() as connection:
+        metadata = acquire_snapshots(
+            out, [window], [], connection=connection,
+            vike_archive=lambda date: (str(day), {"date": date}),
+            reservoir_archive=unavailable, ledger_page=lambda **_: {"items": []},
+        )
+        spill, memory, disk = connection.execute(
+            "SELECT current_setting('temp_directory'), current_setting('memory_limit'), "
+            "current_setting('max_temp_directory_size')"
+        ).fetchone()
+        from pathlib import Path
+        assert Path(spill).resolve().is_relative_to(out.resolve())
+        assert memory == "4.0 GiB"
+        assert disk == "12.0 GiB"
+    budget = metadata["fills"]["acquisition"]["resource_budget"]
+    assert budget["memory_limit"] == "4GiB"
+    assert budget["spill_limit"] == "12GiB"
+    assert budget["max_snapshot_bytes"] > (out / "fills.parquet").stat().st_size
+    assert not list(out.glob(".staging-*"))
+
+
+def test_snapshot_byte_budget_fails_without_success_manifest(tmp_path):
+    day = tmp_path / "day.parquet"
+    vike_file(day, [fill()])
+    window = Window(utc("2026-10-07T00:00:00Z"), utc("2026-10-07T00:00:05Z"))
+    out = tmp_path / "too-small"
+    with duckdb.connect() as connection, pytest.raises(RuntimeError, match="snapshot byte budget"):
+        acquire_snapshots(
+            out, [window], [], connection=connection,
+            vike_archive=lambda date: (str(day), {"date": date}),
+            reservoir_archive=unavailable, ledger_page=lambda **_: {"items": []},
+            max_snapshot_bytes=1,
+        )
+    assert not (out / "metadata.json").exists()
+    assert not list(out.glob(".staging-*"))
+
+
 def test_cursor_cycle_never_claims_complete_coverage(tmp_path):
     out = tmp_path / "incomplete"
     window = Window(utc("2026-10-07T00:00:00Z"), utc("2026-10-07T00:00:05Z"))
@@ -210,6 +351,82 @@ def test_incomplete_ledger_window_cannot_verify_transfers(tmp_path):
     assert report["manifest"]["diagnostics"]["ledger"]["verified"] == 0
     assert report["manifest"]["diagnostics"]["ledger"]["incomplete_window_rows"] == 2
     assert metadata["ledger"]["intervals"] == []
+
+
+@pytest.mark.parametrize("system_address", [
+    "0x" + "0"*40,
+    "0x" + "0"*36 + "dead",
+    "0x" + "22"*20,
+    "0x" + "fe"*20,
+    "0x" + "20" + "00"*18 + "c8",
+])
+def test_system_addresses_cannot_establish_direct_funding_links(tmp_path, system_address):
+    window = Window(utc("2026-10-07T00:00:00Z"), utc("2026-10-07T00:00:05Z"))
+    wallet = "0x" + "b"*40
+    out = tmp_path / "system-address"
+    with duckdb.connect() as connection:
+        metadata = acquire_snapshots(
+            out, [], [window], connection=connection,
+            vike_archive=unavailable, reservoir_archive=unavailable,
+            ledger_page=lambda **p: {"items": [], "nextCursor": None} if p.get("cursor") else {
+                "items": [ledger_item("1", system_address, -125), ledger_item("1", wallet, 125)],
+                "nextCursor": "next",
+            },
+        )
+    report = run_study(out / "fills.parquet", out / "ledger.parquet", metadata)
+    assert report["manifest"]["diagnostics"]["ledger"]["verified"] == 0
+    assert report["manifest"]["diagnostics"]["ledger"]["intermediary"] == 1
+
+
+def test_undated_ledger_row_invalidates_window_even_after_cursor_exhaustion(tmp_path):
+    window = Window(utc("2026-10-07T00:00:00Z"), utc("2026-10-07T00:00:05Z"))
+    a, b = "0x" + "a"*40, "0x" + "b"*40
+    out = tmp_path / "undated"
+    with duckdb.connect() as connection:
+        metadata = acquire_snapshots(
+            out, [], [window], connection=connection,
+            vike_archive=unavailable, reservoir_archive=unavailable,
+            ledger_page=lambda **p: {"items": [], "nextCursor": None} if p.get("cursor") else {
+                "items": [ledger_item("1", a, -125), ledger_item("1", b, 125),
+                          ledger_item("1", "0x" + "c"*40, 125, ts=None)],
+                "nextCursor": "next",
+            },
+        )
+    receipt = metadata["ledger"]["acquisition"]["slices"][0]
+    assert receipt["pagination_exhausted"] is True
+    assert receipt["undated_rows"] == 1
+    assert receipt["complete"] is False
+    assert metadata["ledger"]["intervals"] == []
+    report = run_study(out / "fills.parquet", out / "ledger.parquet", metadata)
+    assert report["manifest"]["diagnostics"]["ledger"]["verified"] == 0
+    assert report["manifest"]["diagnostics"]["ledger"]["invalid_event_time_rows"] == 1
+
+
+def test_daily_ledger_staging_preserves_boundary_and_deduplicates_pages(tmp_path):
+    start = utc("2026-10-07T23:59:59Z")
+    boundary = utc("2026-10-08T00:00:00Z")
+    end = utc("2026-10-08T00:00:01Z")
+    a, b = "0x" + "a"*40, "0x" + "b"*40
+    earlier = [ledger_item("1", a, -125, ts=start.isoformat()),
+               ledger_item("1", b, 125, ts=start.isoformat())]
+    later = [ledger_item("2", a, -125, ts=boundary.isoformat()),
+             ledger_item("2", b, 125, ts=boundary.isoformat())]
+    def page(**params):
+        if params.get("cursor"):
+            return {"items": [], "nextCursor": None}
+        return {"items": earlier + later if params["start"] == start.isoformat() else later,
+                "nextCursor": "done"}
+    out = tmp_path / "ledger-days"
+    with duckdb.connect() as connection:
+        metadata = acquire_snapshots(
+            out, [], [Window(start, end), Window(boundary, end)], connection=connection,
+            vike_archive=unavailable, reservoir_archive=unavailable, ledger_page=page,
+        )
+    assert metadata["ledger"]["intervals"] == [Window(start, boundary).pair(), Window(boundary, end).pair()]
+    assert pl.read_parquet(out / "ledger.parquet").height == 4
+    assert metadata["ledger"]["acquisition"]["slices"][0]["out_of_window_rows"] == 2
+    report = run_study(out / "fills.parquet", out / "ledger.parquet", metadata)
+    assert report["manifest"]["diagnostics"]["ledger"]["verified"] == 2
 
 
 def test_same_hash_different_token_is_not_a_direct_transfer(tmp_path):

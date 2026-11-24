@@ -19,6 +19,24 @@ def _normalized(value):
     return value.strip().lower() if isinstance(value, str) and value.strip() else None
 
 
+# Known sentinel and HyperCore system addresses, not an ownership or CEX map.
+# https://hyperliquid.gitbook.io/hyperliquid-docs/for-developers/hyperevm/hypercore-less-than-greater-than-hyperevm-transfers
+# https://hyperliquid.gitbook.io/hyperliquid-docs/trading/fees
+_SYSTEM_ADDRESSES = {"0x" + "0"*40, "0x" + "0"*36 + "dead",
+                     "0x" + "22"*20, "0x" + "fe"*20}
+
+
+def is_system_address(value):
+    address = _normalized(value)
+    if address is None:
+        return False
+    # 0x20 followed by zero padding and the big-endian token index (up to 64 bits).
+    return address in _SYSTEM_ADDRESSES or (
+        len(address) == 42 and address.startswith("0x20" + "00"*11)
+        and all(c in "0123456789abcdef" for c in address[2:])
+    )
+
+
 def _amount(value):
     try:
         amount = Decimal(str(value))
@@ -111,7 +129,8 @@ def verify_transfers(path: Path | None, cutoff: datetime):
         if any(side[3] != "send" for side in sides):
             counts["non_direct"] += 1
             continue
-        if any(side[4] is not False for side in sides):
+        if any(side[4] is not False or is_system_address(side[0]) or
+               is_system_address(side[1]) for side in sides):
             counts["intermediary"] += 1
             continue
         by_direction = {side[2]: side for side in sides}
