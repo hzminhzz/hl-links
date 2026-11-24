@@ -1,0 +1,25 @@
+[project]
+name = "hl-links"
+version = "0.1.0"
+description = "Point-in-time Hyperliquid wallet funding-relationship research"
+readme = "README.md"
+requires-python = ">=3.14,<3.15"
+license = "MIT"
+dependencies = [
+    "duckdb>=1.3",
+    "polars>=1.30",
+]
+
+[dependency-groups]
+dev = ["pytest>=8.4"]
+
+[build-system]
+requires = ["hatchling>=1.27"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/hl_links"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-ra"
