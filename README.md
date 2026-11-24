@@ -113,4 +113,28 @@ Both providers preserve original signed fee amounts and currencies; the study ru
 
 **Bounded run evidence (November 24, 2026):** 358 Reservoir fills from September 1, 2025 after Vike rejected the date, plus 2,626 Vike fills across three October slices. Reservoir reconciled all 2,626 overlapping fills with zero missing keys or economic discrepancies in these slices. One 60-second ledger window exhausted six pages (45 rows), yielding ten verified transfers, 17 one-sided transactions and four non-direct transactions. All 2,984 sampled fees were USDC. The initial USD-only implementation rejected native USDC fees. Replaying the identical input hashes with the documented native accounting correction resolved all 1,878 historical score-window and 234 eligible forward fill fee units. Cohort counts remained zero proven, zero linked and 49 no-observed-link young wallets; 34 now have valid observed-fill forward scores and 15 have missing forward data. The result remains inconclusive because the time coverage is sparse and the linked cohort is empty. This is integration evidence, not a full archive coverage guarantee or a scientific comparison. Raw snapshots and reports remain ignored under `runs/t02-bounded-v1/`; `report-native-usdc.json` retains the corrected results and all ten verified transfer evidence records. A fresh hardened acquisition under `runs/t02-reviewed-v1/` reproduced the comparison exactly: all three Vike daily footer counts matched their manifests, 2,626/2,626 reconciled fills, zero invalid notionals or conflicting keys, six exhausted ledger pages, ten verified transfers and 34 valid forward wallet scores. Published fill and ledger Parquet files totaled 107,592 bytes; the run manifest records the resource limits. This verifies the bounded path, not full-pilot capacity. A second fresh hardened run under `runs/t02-reviewed-v3/` confirmed zero unclassified market records, all 2,626 shared fills reconciled, the six-page ledger terminating with Vike's exact cursor echo, ten verified transfers retaining source-window provenance, and identical cohort counts and comparison. The regression suite passed all 70 cases, including the empty-page continuation and cutoff-straddling cases. The final quarantine regression run under `runs/t02-reviewed-v4/` reproduced the same cohorts and comparison from a fresh acquisition with zero unclassified rows and zero conflicting keys; all 2,626 shared fills reconciled and all ten verified transfers remained intact. All 80 regression cases passed, including historical and forward identity conflicts in the same window, across separate windows, and with undated source-window evidence, plus compatible Reservoir recovery.
 
-**State:** T01 provides the deterministic study runner; T02 connects historical vendors and demonstrates a bounded real-data run. The full historical pilot belongs to T03. All findings remain exploratory; no trading authorization or production integration.
+## Fixed historical pilot (T03)
+
+The October 23 pilot uses the existing acquisition policy and the same wallet economics as the local runner. Capture historical UTC days separately with the existing read-only credentials:
+
+```bash
+uv run --locked python -m hl_links.pilot \
+  --root runs/t03-pilot \
+  --start 2026-05-01T00:00:00Z \
+  --end 2026-10-23T00:00:00Z
+```
+
+The September 8 ledger retry is an independent replacement receipt at `runs/t03-ledger-retry-0908/`, not a union with the incomplete original. Resume the analysis with:
+
+```bash
+uv run --locked python -m hl_links.pilot_run \
+  --root runs/t03-pilot \
+  --analysis runs/t03-analysis \
+  --ledger-retry runs/t03-ledger-retry-0908
+```
+
+The staged runner verifies immutable input receipts, partitions by normalized fill identity, and combines exact decimal wallet totals across shards. It verifies transaction identity across ledger days, retaining qualifying edges privately. It writes a checksum-verified historical cohort freeze before requesting any forward day. `--freeze-only` stops at that boundary. Subsequent executions reuse completed daily and shard checkpoints; incompatible receipts fail closed. Never launch two writers into the same analysis directory. Inspect disk and memory before running on a shared VPS.
+
+The private analysis directory contains historical and forward partition receipts, wallet-summary checkpoints, `frozen/manifest.json`, `final/manifest.json`, `verified/manifest.json` and `sanitized/manifest.json`. The final verification reconstructs cohorts, ledger diagnostics and forward comparisons from the checksum-verified summaries and ledger evidence. This is checkpoint replay, not independent vendor certification or scientific qualification. Do not commit private run artifacts or signed URLs. Only aggregate sanitized research findings belong in Git.
+
+**State:** T01 provides the deterministic study runner; T02 connects historical vendors and demonstrates a bounded real-data run. T03 requires actual pilot results, not just passing fixture tests. All findings remain exploratory; no trading authorization or production integration.

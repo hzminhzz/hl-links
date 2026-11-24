@@ -66,7 +66,7 @@ WITH params AS (
       -- use event time, including fills captured after the forward window.
       AND (start_at IS NOT NULL OR known_at IS NULL OR known_at <= end_at)
       AND ({_MAIN_PERP})
-      AND (wallets IS NULL OR list_contains(wallets, {_WALLET}))
+      AND (wallets IS NULL OR {_WALLET} IN (SELECT unnest(wallets) FROM params))
 ), unresolved_keys AS (
     -- Retain uncertain market identities as rejection evidence, never trades.
     -- Undated rows can only contradict within a wholly anchored source window.
@@ -80,7 +80,7 @@ WITH params AS (
               AND source_window_end <= end_at)
       )
       AND (start_at IS NOT NULL OR known_at IS NULL OR known_at <= end_at)
-      AND (wallets IS NULL OR list_contains(wallets, {_WALLET}))
+      AND (wallets IS NULL OR {_WALLET} IN (SELECT unnest(wallets) FROM params))
 ), variants AS (
     SELECT wallet, trade_id, event_at, symbol, pnl, fee, fee_unit, notional,
            side, quantity, price, has_execution,
@@ -98,7 +98,7 @@ WITH params AS (
           OR (unclassified_market AND event_at IS NULL
               AND source_window_start < source_window_end AND source_window_end <= start_at)
       )
-      AND (wallets IS NULL OR list_contains(wallets, {_WALLET}))
+      AND (wallets IS NULL OR {_WALLET} IN (SELECT unnest(wallets) FROM params))
 ), checked AS (
     SELECT variants.*,
            count(*) OVER (PARTITION BY wallet, trade_id) AS variants,
@@ -151,13 +151,14 @@ ORDER BY wallet
 class FillArchive:
     """One read-only snapshot; historical and forward queries have separate bounds."""
 
-    def __init__(self, path: Path):
+    def __init__(self, path: Path | list[Path]):
         self._spill = TemporaryDirectory(prefix=".study-spill-", dir=private_runs_dir())
         self.connection = None
         try:
             self.connection = duckdb.connect(":memory:")
             configure_duckdb(self.connection, self._spill.name)
-            self.connection.read_parquet(str(path)).create_view("raw_fill_input")
+            inputs = [str(p) for p in path] if isinstance(path, list) else str(path)
+            self.connection.read_parquet(inputs, hive_partitioning=False).create_view("raw_fill_input")
             schema = dict(
                 (name, dtype)
                 for name, dtype, *_ in self.connection.execute("DESCRIBE raw_fill_input").fetchall()
@@ -230,30 +231,44 @@ class FillArchive:
         result = self.connection.execute(_SUMMARY, [start, end, score_start, wallets])
         columns = [column[0] for column in result.description]
         rows = [dict(zip(columns, row, strict=True)) for row in result.fetchall()]
-        # Coverage is declared independently of sparse observed events. These
-        # counts are diagnostics, not proof that every source day was complete.
-        diagnostics = self.connection.execute(f"""
+        return rows, summary_details(rows, self.diagnostics(start=start, end=end, wallets=wallets))
+
+    def write_summary(self, output: Path, *, start, end, score_start, wallets=None):
+        """Persist the identical SQL result without materializing shard rows in Python."""
+        self.connection.execute("CREATE OR REPLACE TEMP TABLE wallet_summary AS " + _SUMMARY,
+                                [start, end, score_start, wallets])
+        self.connection.execute("COPY wallet_summary TO ? (FORMAT PARQUET, COMPRESSION ZSTD)", [str(output)])
+        return self.diagnostics(start=start, end=end, wallets=wallets)
+
+    def diagnostics(self, *, start, end, wallets=None):
+        # Coverage is declared independently of sparse observed events.
+        return self.connection.execute(f"""
             SELECT count(*) FILTER (WHERE NOT coalesce(({_MAIN_PERP}), false)),
                    count(*) FILTER (WHERE ({_MAIN_PERP}) AND known_at > ?)
             FROM fill_input
             WHERE (?::TIMESTAMPTZ IS NULL OR event_at >= ?) AND event_at < ?
-              AND (?::VARCHAR[] IS NULL OR list_contains(?::VARCHAR[], {_WALLET}))
+              AND (?::VARCHAR[] IS NULL OR {_WALLET} IN (SELECT unnest(?::VARCHAR[])))
         """, [end, start, start, end, wallets, wallets]).fetchone()
-        counters = (
-            "observed_variants", "duplicate_rows", "conflicting_keys", "cross_window_conflicting_keys", "invalid_keys",
-            "unknown_availability", "score_fills", "unknown_fees", "native_usdc_fee_fills", "invalid_pnl",
-            "invalid_notional",
-        )
-        details = {key: sum(row[key] for row in rows) for key in counters}
-        details["excluded_market_rows"], details["late_known_rows"] = diagnostics
-        details["first_observed_at"] = min(
-            (row["first_trade_at"] for row in rows), default=None)
-        details["last_observed_at"] = max(
-            (row["last_trade_at"] for row in rows), default=None)
-        details["first_ingested_at"] = min(
-            (row["first_ingested_at"] for row in rows if row["first_ingested_at"] is not None),
-            default=None)
-        details["last_ingested_at"] = max(
-            (row["last_ingested_at"] for row in rows if row["last_ingested_at"] is not None),
-            default=None)
-        return rows, details
+
+
+SUMMARY_COUNTERS = (
+    "observed_variants", "duplicate_rows", "conflicting_keys", "cross_window_conflicting_keys", "invalid_keys",
+    "unknown_availability", "score_fills", "unknown_fees", "native_usdc_fee_fills", "invalid_pnl",
+    "invalid_notional",
+)
+
+
+def summary_details(rows, diagnostics):
+    details = {key: sum(row[key] for row in rows) for key in SUMMARY_COUNTERS}
+    details["excluded_market_rows"], details["late_known_rows"] = diagnostics
+    details["first_observed_at"] = min(
+        (row["first_trade_at"] for row in rows), default=None)
+    details["last_observed_at"] = max(
+        (row["last_trade_at"] for row in rows), default=None)
+    details["first_ingested_at"] = min(
+        (row["first_ingested_at"] for row in rows if row["first_ingested_at"] is not None),
+        default=None)
+    details["last_ingested_at"] = max(
+        (row["last_ingested_at"] for row in rows if row["last_ingested_at"] is not None),
+        default=None)
+    return details

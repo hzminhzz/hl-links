@@ -45,7 +45,7 @@ def _amount(value):
         return None
 
 
-def verify_transfers(path: Path | None, cutoff: datetime):
+def verify_transfers(path: Path | list[Path] | None, cutoff: datetime):
     """Return canonical edges, their source evidence, and rejection diagnostics."""
     counts = Counter({
         key: 0 for key in (
@@ -56,7 +56,9 @@ def verify_transfers(path: Path | None, cutoff: datetime):
             "incomplete_window_rows",
         )
     })
-    if path is None or not path.is_file():
+    if path is None or (isinstance(path, Path) and not path.is_file()):
+        return [], {}, dict(counts)
+    if isinstance(path, list) and not path:
         return [], {}, dict(counts)
     scan = pl.scan_parquet(path)
     schema = scan.collect_schema()

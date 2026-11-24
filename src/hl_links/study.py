@@ -214,6 +214,18 @@ def run_study(
         if archive:
             archive.close()
 
+    return assemble_report(cohorts=cohorts, evidence=evidence, forward=forward,
+                           fills_receipt=fills_receipt, ledger_receipt=ledger_receipt,
+                           history_counts=history_counts, forward_counts=forward_counts,
+                           fill_input_counts=fill_input_counts, ledger_counts=ledger_counts,
+                           cutoff=cutoff)
+
+
+def assemble_report(*, cohorts, evidence, forward, fills_receipt, ledger_receipt,
+                    history_counts, forward_counts, fill_input_counts, ledger_counts,
+                    cutoff=PILOT_CUTOFF):
+    """One reporting policy for the fixture runner and bounded pilot."""
+    history_start, forward_end = cutoff - 60 * DAY, cutoff + 30 * DAY
     forward_by_wallet = {row["wallet"]: row for row in forward}
     coverage_complete = not (
         fills_receipt["forward_gaps"] or any(fill_input_counts.values())
@@ -314,11 +326,11 @@ def run_study(
                 "ledger": ledger_counts,
             },
             "counts": {
-                "proven": len(frozen.proven),
-                "eligible_young": len(eligible),
-                "linked": len(frozen.linked),
-                "no_observed_link": len(frozen.unlinked),
-                "qualifying_links": len(frozen.links),
+                "proven": len(cohorts["proven"]),
+                "eligible_young": len(cohorts["linked"]) + len(cohorts["no_observed_link"]),
+                "linked": len(cohorts["linked"]),
+                "no_observed_link": len(cohorts["no_observed_link"]),
+                "qualifying_links": len(cohorts["links"]),
                 "valid_linked": comparison["linked"]["valid"],
                 "valid_no_observed_link": comparison["no_observed_link"]["valid"],
             },
