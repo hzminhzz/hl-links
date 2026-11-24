@@ -105,7 +105,8 @@ def _archive_query(provider):
                  THEN lower(trim({wallet}, {whitespace})) END AS wallet,
             trade_id::VARCHAR AS trade_id, {ts}::TIMESTAMPTZ AS event_at,
             NULL::TIMESTAMPTZ AS known_at, ?::TIMESTAMPTZ AS ingested_at,
-            'HL'::VARCHAR AS dex_name, {symbol_value} AS symbol,
+            CASE WHEN {market_value} IS NULL OR {symbol_value} IS NULL
+                 THEN NULL ELSE 'HL' END AS dex_name, {symbol_value} AS symbol,
             try_cast({pnl} AS DOUBLE) AS closed_pnl_usd,
             try_cast(fee AS DOUBLE) AS fee_amount, upper(trim(fee_token)) AS fee_unit,
             CASE WHEN {notional_matches_sql(qty, "price", notional)}
@@ -114,6 +115,7 @@ def _archive_query(provider):
             lower(trim(side)) AS side, {qty}::DOUBLE AS quantity,
             price::DOUBLE AS price, '{provider}' AS source,
             ({market_value} IS NULL OR {symbol_value} IS NULL) AS unclassified_market,
+            ?::TIMESTAMPTZ AS source_window_start, ?::TIMESTAMPTZ AS source_window_end,
             count(*)::BIGINT AS source_rows
         FROM read_parquet(?)
         WHERE ({ts} IS NULL OR ({ts} >= ? AND {ts} < ?))
@@ -126,7 +128,8 @@ _FILL_SCHEMA = """
     wallet VARCHAR, trade_id VARCHAR, event_at TIMESTAMPTZ,
     known_at TIMESTAMPTZ, ingested_at TIMESTAMPTZ, dex_name VARCHAR,
     symbol VARCHAR, closed_pnl_usd DOUBLE, fee_amount DOUBLE, fee_unit VARCHAR,
-    notional_usd DOUBLE, side VARCHAR, quantity DOUBLE, price DOUBLE, source VARCHAR
+    notional_usd DOUBLE, side VARCHAR, quantity DOUBLE, price DOUBLE, source VARCHAR,
+    unclassified_market BOOLEAN, source_window_start TIMESTAMPTZ, source_window_end TIMESTAMPTZ
 """
 _LEDGER_SCHEMA = {
     "transaction_id": pl.String, "wallet": pl.String, "counterparty": pl.String,
@@ -151,7 +154,7 @@ def _read_slice(con, table, provider, archive, window):
         raise SourceUnavailable("archive_manifest_row_count_mismatch")
     captured = _now()
     con.execute(f"CREATE OR REPLACE TEMP TABLE {table} AS " + _archive_query(provider),
-                [captured, uri, window.start, window.end])
+                [captured, window.start, window.end, uri, window.start, window.end])
     # Capture completion, not a fabricated historical receipt.
     captured = _now()
     con.execute(f"UPDATE {table} SET ingested_at = ?", [captured])
@@ -169,7 +172,7 @@ def _read_slice(con, table, provider, archive, window):
     """).fetchone()
     conflicting_keys = con.execute(
         f"SELECT count(*) FROM (SELECT wallet, trade_id FROM {table} "
-        "WHERE NOT unclassified_market GROUP BY ALL HAVING count(*) > 1)"
+        "GROUP BY ALL HAVING count(*) > 1 AND bool_or(NOT unclassified_market))"
     ).fetchone()[0]
     return {"provider": provider, "window": window.pair(),
             "source_date": window.start.date().isoformat(), "identity": identity,
@@ -479,8 +482,8 @@ def acquire_snapshots(output_dir, fill_windows, ledger_windows, *, connection,
             )
             if table is not None:
                 stager.add("fills", lambda path: con.execute(
-                    f"COPY (SELECT * EXCLUDE (source_rows, unclassified_market) FROM {table} "
-                    "WHERE NOT unclassified_market) TO ? (FORMAT PARQUET, COMPRESSION ZSTD)", [str(path)],
+                    f"COPY (SELECT * EXCLUDE (source_rows) FROM {table}) "
+                    "TO ? (FORMAT PARQUET, COMPRESSION ZSTD)", [str(path)],
                 ))
             for name in ("primary_slice", "check_slice"):
                 con.execute(f"DROP TABLE IF EXISTS {name}")
@@ -514,7 +517,8 @@ def acquire_snapshots(output_dir, fill_windows, ledger_windows, *, connection,
         resource_budget = {**duckdb_budget(), "max_snapshot_bytes": max_snapshot_bytes,
                            "staged_bytes": stager.bytes, "published_bytes": stager.published_bytes}
     fee_units = {str(unit): count for unit, count in con.execute(
-        "SELECT fee_unit, count(*) FROM read_parquet(?) GROUP BY fee_unit ORDER BY fee_unit",
+        "SELECT fee_unit, count(*) FROM read_parquet(?) WHERE NOT unclassified_market "
+        "GROUP BY fee_unit ORDER BY fee_unit",
         [str(fills_path)],
     ).fetchall()}
     metadata = {

@@ -285,10 +285,105 @@ def test_unclassifiable_market_rows_require_recovery_or_gap(tmp_path, fallback):
     else:
         assert receipt["selected_provider"] == "vike"
         assert metadata["fills"]["intervals"] == []
-        assert rows["trade_id"].to_list() == ["1"]
+        assert rows.filter(~pl.col("unclassified_market"))["trade_id"].to_list() == ["1"]
+        quarantined = rows.filter(pl.col("unclassified_market")).sort("trade_id")
+        assert quarantined["trade_id"].to_list() == ["2", "3"]
+        assert quarantined["dex_name"].null_count() == 2
+        assert quarantined["source_window_start"].to_list() == [window.start] * 2
+        assert quarantined["source_window_end"].to_list() == [window.end] * 2
         assert set(rows["source"]) == {"vike"}
     report = run_study(out / "fills.parquet", out / "ledger.parquet", metadata)
     assert report["manifest"]["inputs"]["fills"]["acquisition"]["slices"][0]["attempts"][0]["unclassified_market_rows"] == 3
+
+
+@pytest.mark.parametrize("conflict_phase", ["historical", "forward", "both"])
+@pytest.mark.parametrize("placement", ["same_window", "separate_window", "undated"])
+def test_unresolved_market_identity_conflicts_invalidate_only_affected_wallets(
+    tmp_path, conflict_phase, placement,
+):
+    a, b, c, d = ("0x" + letter*40 for letter in "abcd")
+    old = Window(utc("2026-08-01T00:00:00Z"), utc("2026-08-01T00:00:05Z"))
+    recent = Window(utc("2026-10-16T00:00:00Z"), utc("2026-10-16T00:00:05Z"))
+    forward = Window(utc("2026-10-23T00:00:00Z"), utc("2026-10-23T00:00:05Z"))
+    days = {
+        old: [fill(a, 1, fill_ts=old.start)],
+        recent: [fill(a, 2, fill_ts=recent.start, closed_pnl=21000),
+                 fill(b, 3, fill_ts=recent.start),
+                 fill(c, 4, fill_ts=recent.start)],
+        forward: [fill(b, 5, fill_ts=forward.start, closed_pnl=10, fee=0),
+                  fill(c, 6, fill_ts=forward.start, closed_pnl=4, fee=0)],
+    }
+    # A quarantined row alone must never establish a wallet's age/activity.
+    days[recent].append(fill(d, 7, fill_ts=recent.start, asset=None))
+    def conflicting_record(window, other_window, wallet, trade_id, **changes):
+        target = window if placement == "same_window" else other_window
+        event_at = None if placement == "undated" else target.start
+        days.setdefault(target, []).append(fill(wallet, trade_id, fill_ts=event_at, **changes))
+
+    if conflict_phase in ("historical", "both"):
+        conflicting_record(
+            recent, Window(utc("2026-10-17T00:00:00Z"), utc("2026-10-17T00:00:05Z")),
+            a, 2, asset=None, closed_pnl=-21000,
+        )
+    if conflict_phase in ("forward", "both"):
+        conflicting_record(
+            forward, Window(utc("2026-10-24T00:00:00Z"), utc("2026-10-24T00:00:05Z")),
+            b, 5, dex_name=None, closed_pnl=-10,
+        )
+    for window, rows in days.items():
+        vike_file(tmp_path / (str(window.start.date()) + ".parquet"), rows)
+    def ledger_page(**params):
+        if params.get("cursor"):
+            return {"items": [], "nextCursor": params["cursor"]}
+        return {"items": [ledger_item("1", a, -125, ts=recent.start.isoformat()),
+                          ledger_item("1", b, 125, ts=recent.start.isoformat())],
+                "nextCursor": "terminal"}
+    out = tmp_path / "identity-conflict"
+    with duckdb.connect() as connection:
+        metadata = acquire_snapshots(
+            out, list(days), [recent], connection=connection,
+            vike_archive=lambda day: (str(tmp_path / (day + ".parquet")), {"date": day}),
+            reservoir_archive=unavailable, ledger_page=ledger_page,
+        )
+    report = run_study(out / "fills.parquet", out / "ledger.parquet", metadata)
+    historical_conflict = conflict_phase in ("historical", "both")
+    forward_conflict = conflict_phase in ("forward", "both")
+    assert report["cohorts"]["proven"] == ([] if historical_conflict else [a])
+    assert report["cohorts"]["linked"] == ([] if historical_conflict else [b])
+    assert report["cohorts"]["no_observed_link"] == ([b, c] if historical_conflict else [c])
+    counts = report["manifest"]["diagnostics"]
+    assert counts["historical_fills"]["conflicting_keys"] == int(historical_conflict)
+    assert counts["forward_fills"]["conflicting_keys"] == int(forward_conflict)
+    group = "no_observed_link" if historical_conflict else "linked"
+    score = report["comparison"][group]["wallet_scores"][b]
+    assert score["status"] == ("invalid_economics" if forward_conflict else "valid")
+    assert score["score"] == (None if forward_conflict else 5)
+    assert report["comparison"]["no_observed_link"]["wallet_scores"][c]["score"] == 2
+
+
+def test_compatible_reservoir_match_clears_same_identity_market_quarantine(tmp_path):
+    vike, reservoir = tmp_path / "vike.parquet", tmp_path / "reservoir.parquet"
+    vike_file(vike, [fill(), fill(asset=None)])
+    reservoir_file(reservoir, [reservoir_fill()])
+    window = Window(utc("2026-10-07T00:00:00Z"), utc("2026-10-07T00:00:05Z"))
+    out = tmp_path / "resolved"
+    with duckdb.connect() as connection:
+        metadata = acquire_snapshots(
+            out, [window], [], connection=connection,
+            vike_archive=lambda day: (str(vike), {"date": day}),
+            reservoir_archive=lambda day: (str(reservoir), {"date": day}),
+            ledger_page=lambda **_: {"items": []},
+        )
+    receipt = metadata["fills"]["acquisition"]["slices"][0]
+    assert receipt["attempts"][0]["conflicting_keys"] == 1
+    assert receipt["selected_provider"] == "reservoir"
+    assert receipt["reconciliation"]["unresolved_market_rows"] == 0
+    assert metadata["fills"]["intervals"] == [window.pair()]
+    rows = pl.read_parquet(out / "fills.parquet")
+    assert rows.height == 1
+    assert rows["unclassified_market"].to_list() == [False]
+    report = run_study(out / "fills.parquet", out / "ledger.parquet", metadata)
+    assert report["manifest"]["diagnostics"]["historical_fills"]["conflicting_keys"] == 0
 
 
 def test_execution_conflicts_are_not_exact_duplicates(tmp_path):

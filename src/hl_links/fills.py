@@ -23,6 +23,7 @@ FEE_POLICY = "signed USD or native main-perp USDC fees; no external FX or implic
 NOTIONAL_ABS_TOLERANCE = 1e-8
 NOTIONAL_REL_TOLERANCE = 1e-9
 _EXECUTION_FIELDS = {"side", "quantity", "price"}
+_QUARANTINE_FIELDS = {"unclassified_market", "source_window_start", "source_window_end"}
 
 
 def notional_matches_sql(quantity, price, notional):
@@ -37,7 +38,7 @@ def notional_matches_sql(quantity, price, notional):
 
 
 _MAIN_PERP = """
-    upper(trim(dex_name)) = 'HL' AND trim(symbol) <> ''
+    NOT unclassified_market AND upper(trim(dex_name)) = 'HL' AND trim(symbol) <> ''
     AND NOT regexp_matches(symbol, '[@#/:]')
 """
 
@@ -66,6 +67,20 @@ WITH params AS (
       AND (start_at IS NOT NULL OR known_at IS NULL OR known_at <= end_at)
       AND ({_MAIN_PERP})
       AND (wallets IS NULL OR list_contains(wallets, {_WALLET}))
+), unresolved_keys AS (
+    -- Retain uncertain market identities as rejection evidence, never trades.
+    -- Undated rows can only contradict within a wholly anchored source window.
+    SELECT DISTINCT {_WALLET} AS wallet, trim(trade_id::VARCHAR) AS trade_id
+    FROM fill_input, params
+    WHERE unclassified_market
+      AND (
+          ((start_at IS NULL OR event_at >= start_at) AND event_at < end_at)
+          OR (event_at IS NULL AND source_window_start < source_window_end
+              AND (start_at IS NULL OR source_window_start >= start_at)
+              AND source_window_end <= end_at)
+      )
+      AND (start_at IS NOT NULL OR known_at IS NULL OR known_at <= end_at)
+      AND (wallets IS NULL OR list_contains(wallets, {_WALLET}))
 ), variants AS (
     SELECT wallet, trade_id, event_at, symbol, pnl, fee, fee_unit, notional,
            side, quantity, price, has_execution,
@@ -77,13 +92,18 @@ WITH params AS (
 ), earlier_keys AS (
     SELECT DISTINCT {_WALLET} AS wallet, trim(trade_id::VARCHAR) AS trade_id
     FROM fill_input, params
-    WHERE start_at IS NOT NULL AND event_at < start_at
-      AND ({_MAIN_PERP})
+    WHERE start_at IS NOT NULL
+      AND (
+          (event_at < start_at AND (({_MAIN_PERP}) OR unclassified_market))
+          OR (unclassified_market AND event_at IS NULL
+              AND source_window_start < source_window_end AND source_window_end <= start_at)
+      )
       AND (wallets IS NULL OR list_contains(wallets, {_WALLET}))
 ), checked AS (
     SELECT variants.*,
            count(*) OVER (PARTITION BY wallet, trade_id) AS variants,
            earlier_keys.trade_id IS NOT NULL AS cross_window_conflict,
+           unresolved_keys.trade_id IS NOT NULL AS unresolved_identity,
            trade_id IS NULL OR trade_id = '' OR wallet IS NULL OR wallet = '' AS bad_key,
            fee_unit IS NULL OR fee_unit NOT IN ('USD', 'USDC') OR fee IS NULL AS bad_fee,
            pnl IS NULL AS bad_pnl,
@@ -96,7 +116,9 @@ WITH params AS (
                    false))
                AS bad_notional,
            event_at >= score_start AS in_score
-    FROM variants LEFT JOIN earlier_keys USING (wallet, trade_id), params
+    FROM variants
+    LEFT JOIN earlier_keys USING (wallet, trade_id)
+    LEFT JOIN unresolved_keys USING (wallet, trade_id), params
 )
 SELECT wallet, min(event_at) AS first_trade_at, max(event_at) AS last_trade_at,
        CASE WHEN count(*) FILTER (WHERE known_at IS NULL) > 0 THEN NULL
@@ -104,7 +126,7 @@ SELECT wallet, min(event_at) AS first_trade_at, max(event_at) AS last_trade_at,
        min(first_ingested_at) AS first_ingested_at, max(last_ingested_at) AS last_ingested_at,
        count(*) AS observed_variants,
        sum(raw_count - 1)::BIGINT AS duplicate_rows,
-       count(DISTINCT trade_id) FILTER (WHERE variants > 1) AS conflicting_keys,
+       count(DISTINCT trade_id) FILTER (WHERE variants > 1 OR unresolved_identity) AS conflicting_keys,
        count(DISTINCT trade_id) FILTER (WHERE cross_window_conflict) AS cross_window_conflicting_keys,
        count(*) FILTER (WHERE bad_key) AS invalid_keys,
        count(*) FILTER (WHERE known_at IS NULL) AS unknown_availability,
@@ -114,11 +136,11 @@ SELECT wallet, min(event_at) AS first_trade_at, max(event_at) AS last_trade_at,
        count(*) FILTER (WHERE in_score AND bad_pnl) AS invalid_pnl,
        count(*) FILTER (WHERE bad_notional) AS invalid_notional,
        coalesce(sum(pnl - fee) FILTER (
-           WHERE in_score AND NOT bad_key AND variants = 1
+           WHERE in_score AND NOT bad_key AND variants = 1 AND NOT unresolved_identity
              AND NOT bad_notional AND NOT bad_fee AND NOT bad_pnl
        ), 0) AS net_pnl,
        coalesce(sum(notional) FILTER (
-           WHERE in_score AND NOT bad_key AND variants = 1 AND NOT bad_notional
+           WHERE in_score AND NOT bad_key AND variants = 1 AND NOT unresolved_identity AND NOT bad_notional
        ), 0) AS notional
 FROM checked
 GROUP BY wallet
@@ -155,6 +177,18 @@ class FillArchive:
             else:
                 # T01 normalized fixture contract remains supported.
                 extras = "NULL::VARCHAR AS side, NULL::DOUBLE AS quantity, NULL::DOUBLE AS price, false AS has_execution"
+            quarantine = _QUARANTINE_FIELDS & schema.keys()
+            if quarantine and quarantine != _QUARANTINE_FIELDS:
+                raise ValueError("Fill quarantine flag and source-window bounds must be supplied together")
+            if quarantine:
+                if schema["unclassified_market"] != "BOOLEAN":
+                    raise ValueError("Fill unclassified_market must be boolean")
+                for field in ("source_window_start", "source_window_end"):
+                    if schema[field] != "TIMESTAMP WITH TIME ZONE":
+                        raise ValueError(f"Fill {field} must be timezone-aware")
+                extras += ", coalesce(unclassified_market, true) AS unclassified_market, source_window_start, source_window_end"
+            else:
+                extras += ", false AS unclassified_market, NULL::TIMESTAMPTZ AS source_window_start, NULL::TIMESTAMPTZ AS source_window_end"
             self.connection.execute(f"CREATE VIEW fill_input AS SELECT {projection}, {extras} FROM raw_fill_input")
         except BaseException:
             self.close()
