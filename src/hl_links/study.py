@@ -68,6 +68,7 @@ def _input_receipt(path: Path | None, metadata: dict, key: str) -> dict:
         "source": declaration.get("source"),
         "retrieval_id": declaration.get("retrieval_id"),
         "declared_intervals": sorted(set(intervals)),
+        **({"acquisition": declaration["acquisition"]} if "acquisition" in declaration else {}),
     }
 
 
@@ -262,6 +263,9 @@ def run_study(
         partial = True
     if ledger_counts["unknown_availability_rows"]:
         limitations.append("Ledger availability is unknown for some historical evidence.")
+    if ledger_counts["incomplete_window_rows"]:
+        limitations.append("Unexhausted ledger windows cannot establish verified transfers.")
+        partial = True
     if any(ledger_counts[key] for key in ("one_sided", "ambiguous", "incompatible", "invalid_rows", "late_known_rows")):
         limitations.append("Some ledger events are missing a side, incompatible, ambiguous, invalid or later-known; no qualifying edge inferred.")
     if comparison["mean_difference"] is None:
@@ -273,6 +277,7 @@ def run_study(
     report = {
         "status": status,
         "cohorts": cohorts,
+        "verified_transfers": [evidence[tx] for tx in sorted(evidence)],
         "comparison": comparison,
         "limitations": limitations,
         "manifest": {

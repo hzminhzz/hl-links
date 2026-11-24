@@ -80,4 +80,33 @@ Example coverage metadata (illustrative, not verified live coverage):
 
 Intervals describe actual producer-verified coverage, not minimum/maximum timestamps of sparse rows. Use opaque retrieval identities without credentials. Input SHA-256s and code digest, declared coverage and gaps, cohort membership, transfer evidence, per-wallet outcomes, counts and limitations are recorded in the JSON report. Missing input paths, unresolved economics, undated records and coverage gaps are disclosed; an absent valid denominator produces an inconclusive result. Unattributable main-perpetual forward fills (null or blank wallet identity) make coverage incomplete and are counted before filtering for eligible wallets. No observed forward volume under incomplete coverage is classified as missing data, not inactivity. Positive-volume scores under incomplete coverage describe observed fills only. A comparison with declared coverage gaps, undated records or invalid economics is partial. The nominal descriptive interval is not cluster-aware evidence of skill.
 
-**State:** T01 implements the deterministic local-fixture pipeline. Vendor acquisition and the actual historical pilot belong to T02 and T03. All findings remain exploratory; no trading authorization or production integration.
+## Bounded vendor acquisition (T02)
+
+The acquisition CLI produces the same normalized Parquet inputs and coverage JSON consumed by the T01 runner. It uses an existing `VIKE_API_KEY` environment variable and the AWS CLI's read-only Reservoir profile (default: `reservoir`). Load the existing credentials in the shell without copying them into this repository. DuckDB's HTTP extension is installed in ignored `runs/duckdb_extensions/`; no vendor SDK, archive mirror or new service is needed.
+
+Example bounded integration slice (UTC half-open windows):
+
+```bash
+uv run --locked python -m hl_links.acquire \
+  --output-dir runs/t02-slice \
+  --fill-window 2025-09-01T00:00:00Z/2025-09-01T00:00:05Z \
+  --fill-window 2026-10-07T00:00:00Z/2026-10-07T00:00:05Z \
+  --fill-window 2026-10-22T00:00:00Z/2026-10-22T00:00:05Z \
+  --fill-window 2026-10-23T00:00:00Z/2026-10-23T00:00:05Z \
+  --ledger-window 2026-10-07T00:00:00Z/2026-10-07T00:01:00Z \
+  --reconcile --page-limit 10 --max-pages 100
+
+uv run --locked python -m hl_links.study \
+  --fills runs/t02-slice/fills.parquet \
+  --ledger runs/t02-slice/ledger.parquet \
+  --metadata runs/t02-slice/metadata.json \
+  --output runs/t02-slice/report.json
+```
+
+Acquisition coalesces overlapping requests, splits fill windows at UTC day boundaries and ledger windows at 31 days, and reads only projected fill fields. Vike is primary; missing or unreadable archive slices fall back to Reservoir. Optional reconciliation compares normalized wallet/trade identities and economics without appending overlapping vendor rows. Discrepancies remove the affected interval from declared coverage. Ledger pages are exhausted by cursor until an empty page; repeated or missing cursors and page-budget exhaustion leave the window incomplete and its events cannot establish verified transfers. Ledger retrieval uses the study's $100 minimum per side; unmatched or inconsistent events do not establish independence. Token, direction, hash, compatible amount, event time and counterparty evidence are checked for direct sends. Exchange/intermediary attribution beyond the supplied event fields is not established.
+
+Both providers preserve original signed fee amounts and currencies; USDC is **not** silently converted to USD. Historical availability is unknown, not the actual ingestion timestamp. The report retains all verified two-sided evidence privately and records source receipts, gaps, fallbacks and discrepancies.
+
+**Bounded run evidence (November 24, 2026):** 358 Reservoir fills from September 1, 2025 after Vike rejected the date, plus 2,626 Vike fills across three October slices. Reservoir reconciled all 2,626 overlapping fills with zero missing keys or economic discrepancies in these slices. One 60-second ledger window exhausted six pages (45 rows), yielding ten verified transfers, 17 one-sided transactions and four non-direct transactions. All 2,984 sampled fees were USDC; the approved USD-only policy yielded zero proven or linked wallets and 49 young wallets with no observed link. Of those, 34 had sampled forward activity but invalid fee economics, and 15 had missing forward data. The result is inconclusive. This is sparse integration evidence, not a full archive coverage guarantee or a scientific comparison. Raw snapshots and reports remain ignored under `runs/t02-bounded-v1/`; the hardened runner reproduced the original cohorts and outcomes and retained all ten transfer evidence records.
+
+**State:** T01 provides the deterministic study runner; T02 connects historical vendors and demonstrates a bounded real-data run. The full historical pilot belongs to T03. All findings remain exploratory; no trading authorization or production integration.

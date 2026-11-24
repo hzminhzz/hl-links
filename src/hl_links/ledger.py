@@ -35,6 +35,7 @@ def verify_transfers(path: Path | None, cutoff: datetime):
             "invalid_rows", "invalid_event_time_rows", "undated_conflicting_transactions",
             "one_sided", "ambiguous", "non_direct",
             "intermediary", "self", "incompatible", "below_minimum", "verified",
+            "incomplete_window_rows",
         )
     })
     if path is None or not path.is_file():
@@ -56,7 +57,8 @@ def verify_transfers(path: Path | None, cutoff: datetime):
         tx for raw in undated.filter(pl.col("known_at") <= cutoff)["transaction_id"]
         if (tx := _normalized(raw))
     }
-    data = scan.select(sorted(_REQUIRED)).filter(
+    optional = {"token", "window_complete"} & set(schema.names())
+    data = scan.select(sorted(_REQUIRED | optional)).filter(
         (pl.col("event_at") >= cutoff - timedelta(days=60))
         & (pl.col("event_at") < cutoff)
     ).collect()
@@ -69,6 +71,11 @@ def verify_transfers(path: Path | None, cutoff: datetime):
             continue
         counts["unknown_availability_rows"] += row["known_at"] is None
         tx = _normalized(row["transaction_id"])
+        if row.get("window_complete", True) is not True:
+            counts["incomplete_window_rows"] += 1
+            if tx:
+                invalid_transactions.add(tx)
+            continue
         wallet = _normalized(row["wallet"])
         source = row["source"]
         amount = _amount(row["amount_usd"])
@@ -80,6 +87,7 @@ def verify_transfers(path: Path | None, cutoff: datetime):
         key = (
             wallet, _normalized(row["counterparty"]), _normalized(row["direction"]),
             _normalized(row["transfer_type"]), row["intermediary"], row["event_at"], amount,
+            _normalized(row.get("token")),
         )
         evidence = (source, row["known_at"], row["ingested_at"])
         if key in groups[tx]:
@@ -119,6 +127,7 @@ def verify_transfers(path: Path | None, cutoff: datetime):
             outgoing[1] not in (None, recipient)
             or incoming[1] not in (None, sender)
             or outgoing[5:] != incoming[5:]
+            or ("token" in optional and outgoing[7] is None)
         ):
             counts["incompatible"] += 1
             continue
@@ -151,6 +160,7 @@ def verify_transfers(path: Path | None, cutoff: datetime):
             "sender_evidence": outgoing_evidence, "recipient_evidence": incoming_evidence,
             "sender_reported_counterparty": outgoing[1],
             "recipient_reported_counterparty": incoming[1],
+            **({"token": outgoing[7]} if "token" in optional else {}),
         }
         counts["verified"] += 1
     return edges, evidence_by_tx, dict(counts)
