@@ -1,5 +1,6 @@
 """Exact partitioning must preserve the T01 economic and PIT semantics."""
 import json
+from pathlib import Path
 
 import polars as pl
 import pytest
@@ -53,6 +54,161 @@ def test_identity_shards_preserve_cross_day_conflicts_and_cutoff(tmp_path):
     with pytest.raises(ValueError, match="checkpoint"):
         summarize_partitions([shards], tmp_path / "history", start=None,
                              end=T, score_start=T-59*DAY)
+
+
+def test_summary_and_combine_require_disk_headroom(tmp_path, monkeypatch):
+    from hl_links import resources
+    from hl_links.pilot_analysis import combine_summaries
+
+    source = tmp_path / "fills.parquet"
+    pl.DataFrame(base_fills(), schema=FILL_SCHEMA).write_parquet(source)
+    parts = tmp_path / "parts"
+    partition_fills([source], parts, buckets=1)
+    output = tmp_path / "summary"
+    usage = resources.shutil.disk_usage
+    monkeypatch.setattr(resources.shutil, "disk_usage",
+                        lambda path: usage(path)._replace(free=0))
+    with pytest.raises(resources.SnapshotBudgetExceeded):
+        summarize_partitions([parts], output, start=None, end=T, score_start=T-60*DAY)
+    assert not (output / "bucket-000").exists()
+    monkeypatch.setattr(resources.shutil, "disk_usage", usage)
+    summarize_partitions([parts], output, start=None, end=T, score_start=T-60*DAY)
+    monkeypatch.setattr(resources.shutil, "disk_usage",
+                        lambda path: usage(path)._replace(free=0))
+    with pytest.raises(resources.SnapshotBudgetExceeded):
+        combine_summaries([output / "bucket-000"])
+
+
+def test_partition_contract_rejects_changed_hash_semantics(tmp_path):
+    source = tmp_path / "fills.parquet"
+    pl.DataFrame(base_fills(), schema=FILL_SCHEMA).write_parquet(source)
+    parts = tmp_path / "parts"
+    partition_fills([source], parts, buckets=2)
+    receipt = parts / "receipt.json"
+    record = json.loads(receipt.read_text())
+    assert record["partition_contract"]["duckdb"]
+    record["partition_contract"]["duckdb"] = "incompatible"
+    receipt.write_text(json.dumps(record))
+    with pytest.raises(ValueError, match="Partition contract"):
+        summarize_partitions([parts], tmp_path / "summary", start=None, end=T,
+                             score_start=T-60*DAY)
+
+
+def test_legacy_partition_is_validated_without_rewriting(tmp_path):
+    source = tmp_path / "fills.parquet"
+    pl.DataFrame(base_fills(), schema=FILL_SCHEMA).write_parquet(source)
+    parts = tmp_path / "parts"
+    partition_fills([source], parts, buckets=4)
+    receipt = parts / "receipt.json"
+    record = json.loads(receipt.read_text())
+    del record["partition_contract"]
+    receipt.write_text(json.dumps(record))
+    before = receipt.read_bytes()
+    summarize_partitions([parts], tmp_path / "summary", start=None, end=T,
+                         score_start=T-60*DAY)
+    assert receipt.read_bytes() == before
+    # Misfile a real shard under a different bucket and update its path.
+    first = record["shards"][0]
+    old = parts / first["path"]
+    wrong_bucket = (int(old.parent.name.split("=")[1]) + 1) % record["buckets"]
+    new = parts / f"bucket={wrong_bucket}" / "wrong.parquet"
+    new.parent.mkdir(exist_ok=True)
+    old.rename(new)
+    first["path"] = str(new.relative_to(parts))
+    receipt.write_text(json.dumps(record))
+    with pytest.raises(ValueError, match="Legacy partition contract"):
+        summarize_partitions([parts], tmp_path / "other-summary", start=None, end=T,
+                             score_start=T-60*DAY)
+
+
+def test_standalone_acquisition_cannot_cross_cutoff(tmp_path, monkeypatch):
+    from hl_links import pilot
+
+    monkeypatch.setattr(pilot, "private_runs_dir", lambda: tmp_path)
+    monkeypatch.setattr(pilot, "acquire_day",
+                        lambda *args: pytest.fail("forward provider accessed"))
+    with pytest.raises(SystemExit) as exc:
+        pilot.main(["--root", str(tmp_path / "days"),
+                    "--start", T.isoformat(), "--end", (T + DAY).isoformat()])
+    assert exc.value.code == 2
+
+
+def test_forward_day_api_requires_freeze(tmp_path, monkeypatch):
+    from hl_links import pilot
+
+    monkeypatch.setattr(pilot, "_capture_day",
+                        lambda *args: pytest.fail("forward provider accessed"))
+    with pytest.raises(ValueError, match="historical freeze"):
+        pilot.acquire_day(tmp_path, T)
+
+
+def test_incomplete_day_recovers_without_overwriting_receipts(tmp_path, monkeypatch):
+    from hl_links import pilot
+
+    calls = []
+    day = T - DAY
+    def capture(root, start, **kwargs):
+        calls.append(root)
+        destination = root / start.date().isoformat()
+        destination.mkdir(parents=True)
+        meta = {"fills": {"intervals": [[start.isoformat(), T.isoformat()]] if len(calls) >= 3 else [],
+                          "acquisition": {"slices": [{"coverage_complete": len(calls) >= 3}]}},
+                "ledger": {"intervals": [[start.isoformat(), T.isoformat()]],
+                           "acquisition": {"slices": [{"complete": True}]}}}
+        for name in ("fills.parquet", "ledger.parquet"):
+            (destination / name).touch()
+        (destination / "metadata.json").write_text(json.dumps(meta))
+        return meta
+
+    monkeypatch.setattr(pilot, "_capture_day", capture, raising=False)
+    first = pilot.acquire_day(tmp_path, day, max_attempts=2)
+    assert not first["fills"]["acquisition"]["slices"][0]["coverage_complete"]
+    assert len(calls) == 2
+    original = tmp_path / day.date().isoformat() / "metadata.json"
+    before = original.read_bytes()
+    second = pilot.acquire_day(tmp_path, day, max_attempts=2)
+    assert second["fills"]["acquisition"]["slices"][0]["coverage_complete"]
+    assert len(calls) == 3
+    assert original.read_bytes() == before
+    assert pilot.acquire_day(tmp_path, day) == second
+    assert len(calls) == 3
+    from hl_links.pilot_run import daily_receipt
+    receipt = daily_receipt(tmp_path, "fills", day, T)
+    assert receipt["days"][0]["path"] != str(original.with_name("fills.parquet"))
+    assert receipt["days"][0]["declaration"] == second["fills"]
+
+
+def test_ledger_recovery_keeps_first_complete_fill_receipt(tmp_path, monkeypatch):
+    from hl_links import pilot
+    from hl_links.pilot_run import daily_receipt
+
+    day = T - DAY
+    original = tmp_path / day.date().isoformat()
+    calls = []
+    def capture(root, start, **kwargs):
+        calls.append(kwargs)
+        directory = root / start.date().isoformat()
+        directory.mkdir(parents=True)
+        meta = {"fills": {"intervals": [[start.isoformat(), T.isoformat()]],
+                          "acquisition": {"slices": [{"coverage_complete": True}]}},
+                "ledger": {"intervals": [[start.isoformat(), T.isoformat()]] if len(calls) >= 3 else [],
+                           "acquisition": {"slices": [{"complete": len(calls) >= 3}]}}}
+        for name in ("fills.parquet", "ledger.parquet"):
+            (directory / name).write_bytes(str(len(calls)).encode())
+        (directory / "metadata.json").write_text(json.dumps(meta))
+        return meta
+
+    monkeypatch.setattr(pilot, "_capture_day", capture)
+    pilot.acquire_day(tmp_path, day)
+    pilot.acquire_day(tmp_path, day)
+    fills = daily_receipt(tmp_path, "fills", day, T)
+    ledger = daily_receipt(tmp_path, "ledger", day, T)
+    assert Path(fills["days"][0]["path"]) == original / "fills.parquet"
+    assert Path(ledger["days"][0]["path"]).read_bytes() == b"3"
+    assert (original / "ledger.parquet").read_bytes() == b"1"
+    assert calls == [{"fill_needed": True, "ledger_needed": True},
+                     {"fill_needed": False, "ledger_needed": True},
+                     {"fill_needed": False, "ledger_needed": True}]
 
 
 def test_ledger_shards_match_complete_transaction_evidence(tmp_path):
@@ -117,7 +273,7 @@ def test_staged_pilot_freezes_before_provider_and_matches_fixture(tmp_path, monk
 
     calls = []
 
-    def provider(path, day):
+    def provider(path, day, *, analysis):
         assert (analysis / "frozen" / "receipt.json").is_file()
         calls.append(day)
         return day_snapshot(path / day.date().isoformat(), day,
@@ -141,6 +297,26 @@ def test_staged_pilot_freezes_before_provider_and_matches_fixture(tmp_path, monk
     verification = runner.verify_replay(root, analysis, frozen, report)
     assert verification["cohorts_equal"] and verification["outcomes_equal"]
     assert runner.verify_replay(root, analysis, frozen, report) == verification
+    historical = next(iter(frozen["history_receipt"]["days"]))
+    source = Path(historical["path"])
+    original_bytes = source.read_bytes()
+    source.write_bytes(original_bytes + b"changed")
+    with pytest.raises(ValueError, match="Historical.*(input|receipt)|checksum"):
+        runner.verify_replay(root, analysis, frozen, report)
+    source.write_bytes(original_bytes)
+    history_part = Path(frozen["history_partitions"][0]["path"])
+    partition_receipt = history_part / "receipt.json"
+    before = partition_receipt.read_bytes()
+    partition_receipt.write_bytes(before + b" ")
+    with pytest.raises(ValueError, match="Historical partition receipt"):
+        runner.verify_replay(root, analysis, frozen, report)
+    partition_receipt.write_bytes(before)
+    summary = next((analysis / "forward-summary").glob("bucket-*/summary.parquet"))
+    before = summary.read_bytes()
+    summary.write_bytes(before + b"changed")
+    with pytest.raises(ValueError, match="Summary checkpoint checksum"):
+        runner.verify_replay(root, analysis, frozen, report)
+    summary.write_bytes(before)
     clean = runner.sanitized(report)
     assert "wallet_scores" not in clean["comparison"]["linked"]
     assert "cohorts" not in clean

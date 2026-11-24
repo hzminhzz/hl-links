@@ -13,7 +13,7 @@ from tempfile import TemporaryDirectory
 import duckdb
 
 from .fills import FillArchive, SUMMARY_COUNTERS, _WALLET, summary_details
-from .resources import configure_duckdb, private_runs_dir, require_disk_headroom
+from .resources import SPILL_LIMIT_BYTES, configure_duckdb, private_runs_dir, require_disk_headroom
 from .ledger import verify_transfers
 from .study import _sha256, _json_default
 
@@ -30,11 +30,45 @@ def wallet_digest(wallets):
         json.dumps(sorted(set(wallets))).encode()).hexdigest()
 
 
+FILL_KEY = f"{_WALLET}, trim(trade_id::VARCHAR)"
+# Python strip() whitespace, including Unicode separators.
+_LEDGER_WHITESPACE = " || ".join(f"chr({ord(c)})" for c in "\t\n\v\f\r \x1c\x1d\x1e\x1f\x85\xa0\u1680\u2000\u2001\u2002\u2003\u2004\u2005\u2006\u2007\u2008\u2009\u200a\u2028\u2029\u202f\u205f\u3000")
+LEDGER_KEY = f"lower(trim(transaction_id, {_LEDGER_WHITESPACE}))"
+
+
+def partition_contract(key):
+    return {"duckdb": duckdb.__version__, "identity_sql": key,
+            "algorithm": "duckdb_hash_modulo_v1"}
+
+
+def validate_partition_contract(root, receipt, key):
+    expected = partition_contract(key)
+    if "partition_contract" in receipt:
+        if receipt["partition_contract"] != expected:
+            raise ValueError("Partition contract mismatch")
+        return
+    # Pre-contract receipts remain immutable. Prove compatibility from actual
+    # bucket assignment under the current engine, rather than guessing its version.
+    files = [str(root / item["path"]) for item in receipt["shards"]]
+    if not files:
+        if receipt["rows"] != 0:
+            raise ValueError("Legacy partition contract row mismatch")
+        return
+    with duckdb.connect() as con:
+        con.execute("SET threads=4")
+        rows, wrong = con.execute(f"""
+            SELECT count(*), count(*) FILTER (WHERE hash({key}) % ? != bucket)
+            FROM read_parquet(?, hive_partitioning=true)
+        """, [receipt["buckets"], files]).fetchone()
+    if wrong or rows != receipt["rows"]:
+        raise ValueError("Legacy partition contract mismatch")
+
+
 def partition_fills(inputs, output, *, buckets=64, wallets=None):
     """Project normalized snapshots into identity shards, optionally for a frozen cohort."""
     where = "" if wallets is None else f"WHERE {_WALLET} IN (SELECT unnest(?::VARCHAR[]))"
     return _partition(inputs, output, buckets=buckets,
-                      key=f"{_WALLET}, trim(trade_id::VARCHAR)",
+                      key=FILL_KEY,
                       where=where, parameters=[] if wallets is None else [sorted(set(wallets))],
                       selection=wallet_digest(wallets))
 
@@ -73,6 +107,7 @@ def _partition(inputs, output, *, buckets, key, where="", parameters=(), selecti
                 raise ValueError("Partition row conservation failure")
         _write_json(target / "receipt.json", {
             "buckets": buckets, "rows": source_rows, "raw_rows": raw_rows,
+            "partition_contract": partition_contract(key),
             "wallets_sha256": selection,
             "inputs": [{"path": str(p), "sha256": _sha256(p)} for p in inputs],
             "shards": [{"path": str(p.relative_to(target)), "sha256": _sha256(p)} for p in files],
@@ -80,7 +115,7 @@ def _partition(inputs, output, *, buckets, key, where="", parameters=(), selecti
         target.rename(output)
 
 
-def _partition_inputs(roots, *, hashes=None):
+def _partition_inputs(roots, *, hashes=None, key=FILL_KEY):
     by_bucket, seen, sources = {}, set(), set()
     bucket_count = None
     for root in sorted(map(Path, roots)):
@@ -104,6 +139,7 @@ def _partition_inputs(roots, *, hashes=None):
             by_bucket.setdefault(bucket, []).append(path)
             if hashes is not None:
                 hashes[path] = item["sha256"]
+        validate_partition_contract(root, receipt, key)
     return by_bucket
 
 
@@ -129,6 +165,8 @@ def summarize_shard(paths, output, *, start, end, score_start, wallets=None, exp
             raise ValueError("Summary checkpoint checksum mismatch")
         return
     output.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    require_disk_headroom(private_runs_dir(), SPILL_LIMIT_BYTES)
+    require_disk_headroom(output.parent, SPILL_LIMIT_BYTES + sum(p.stat().st_size for p in paths))
     with TemporaryDirectory(prefix=".summary-", dir=output.parent) as stage:
         stage = Path(stage)
         with FillArchive(paths) as archive:
@@ -152,7 +190,9 @@ def combine_summaries(outputs):
         files.append(str(path))
         diagnostics = [a+b for a,b in zip(diagnostics, receipt["diagnostics"], strict=True)]
     counters = ", ".join(f"sum({key})::BIGINT AS {key}" for key in SUMMARY_COUNTERS)
-    with TemporaryDirectory(prefix=".combine-", dir=private_runs_dir()) as spill:
+    spill_root = private_runs_dir()
+    require_disk_headroom(spill_root, SPILL_LIMIT_BYTES)
+    with TemporaryDirectory(prefix=".combine-", dir=spill_root) as spill:
         with duckdb.connect() as con:
             configure_duckdb(con, spill)
             result = con.execute(f"""
@@ -170,28 +210,31 @@ def combine_summaries(outputs):
     return rows, summary_details(rows, diagnostics)
 
 
-def summarize_partitions(roots, output, *, start, end, score_start, wallets=None):
+def summarize_partitions(roots, output, *, start, end, score_start, wallets=None, verify_only=False):
     hashes = {}
     shards = _partition_inputs(roots, hashes=hashes)
     outputs = []
     for bucket, paths in sorted(shards.items()):
         part = Path(output) / f"bucket-{bucket:03d}"
+        if verify_only and not part.is_dir():
+            raise ValueError("Missing summary checkpoint")
         summarize_shard(paths, part, start=start, end=end, score_start=score_start,
                         wallets=wallets, expected_hashes=hashes)
         outputs.append(part)
         print("summary checkpoint", part.name, flush=True)
+    if verify_only and set(Path(output).glob("bucket-*")) != set(outputs):
+        raise ValueError("Unexpected summary checkpoint")
     return combine_summaries(outputs) if outputs else ([], summary_details([], (0, 0)))
 
 
-def verify_partitioned_ledger(inputs, output, *, cutoff, proven, young, buckets=32):
+def verify_partitioned_ledger(inputs, output, *, cutoff, proven, young, buckets=32,
+                              verify_only=False):
     """Verify each transaction once across all source days; retain only study edges."""
     output = Path(output)
-    # Python strip() whitespace, including Unicode separators. Acquisition emits
-    # canonical lower-case hex transaction IDs or null.
-    whitespace = " || ".join(f"chr({ord(c)})" for c in "\t\n\v\f\r \x1c\x1d\x1e\x1f\x85\xa0\u1680\u2000\u2001\u2002\u2003\u2004\u2005\u2006\u2007\u2008\u2009\u200a\u2028\u2029\u202f\u205f\u3000")
     if not output.exists():
-        _partition(inputs, output, buckets=buckets,
-                   key=f"lower(trim(transaction_id, {whitespace}))")
+        if verify_only:
+            raise ValueError("Missing ledger partition checkpoint")
+        _partition(inputs, output, buckets=buckets, key=LEDGER_KEY)
     else:
         receipt = json.loads((output / "receipt.json").read_text())
         expected = [{"path": str(p), "sha256": _sha256(p)} for p in inputs]
@@ -203,7 +246,7 @@ def verify_partitioned_ledger(inputs, output, *, cutoff, proven, young, buckets=
     edges, evidence = [], {}
     _, _, empty_counts = verify_transfers(None, cutoff)
     counts = Counter(empty_counts)
-    for _, paths in sorted(_partition_inputs([output]).items()):
+    for _, paths in sorted(_partition_inputs([output], key=LEDGER_KEY).items()):
         shard_edges, shard_evidence, shard_counts = verify_transfers(paths, cutoff)
         counts.update(shard_counts)
         for edge in shard_edges:

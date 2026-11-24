@@ -13,12 +13,12 @@ import duckdb
 
 from .cohorts import make_cohorts
 from .fills import FillArchive
-from .pilot import ARCHIVE_START, LEDGER_START, FORWARD_END, acquire_day
+from .pilot import ARCHIVE_START, LEDGER_START, FORWARD_END, acquire_day, complete_day, select_day
 from .pilot_analysis import (
     _write_json, partition_fills, summarize_partitions, verify_partitioned_ledger,
-    combine_summaries, wallet_digest,
+    wallet_digest,
 )
-from .resources import private_runs_dir
+from .resources import SnapshotBudgetExceeded, private_runs_dir
 from .study import (
     DAY, PILOT_CUTOFF as T, _code_digest, _gaps, _json_default, _sha256, _utc,
     _wallet_records, assemble_report,
@@ -49,12 +49,12 @@ def daily_receipt(root, name, start, end, *, replacements=None):
     replacements = replacements or {}
     for day in _days(start, end):
         label = day.date().isoformat()
-        directory = replacements.get(label, root / label)
-        path, meta = directory / f"{name}.parquet", directory / "metadata.json"
-        if not path.is_file() or not meta.is_file():
+        selected = select_day(root, day, name, extra=replacements.get(label))
+        if selected is None:
             missing.append(label)
             continue
-        declaration = json.loads(meta.read_text())[name]
+        directory, declaration = selected
+        path, meta = directory / f"{name}.parquet", directory / "metadata.json"
         declared = [tuple(map(_utc, pair)) for pair in declaration["intervals"]]
         if any(not day <= left < right <= day + DAY for left, right in declared):
             raise ValueError("Daily coverage outside requested UTC day")
@@ -74,11 +74,10 @@ def _paths(receipt):
     return [Path(item["path"]) for item in receipt["days"]]
 
 
-def partition_days(receipt, root, *, wallets=None):
-    """Resume disjoint completed batches, refusing changed or duplicated input."""
+def _validate_partition_set(receipt, directories, *, wallets=None, allow_missing=False):
     expected = {Path(item["path"]).resolve(): item["sha256"] for item in receipt["days"]}
     seen = set()
-    for directory in _roots(root):
+    for directory in directories:
         record = json.loads((directory / "receipt.json").read_text())
         if record["buckets"] != 64 or record.get("wallets_sha256") != wallet_digest(wallets):
             raise ValueError("Unexpected fill partition configuration")
@@ -88,6 +87,14 @@ def partition_days(receipt, root, *, wallets=None):
                 raise ValueError("Partition checkpoint input mismatch")
             seen.add(path)
     missing = [p for p in _paths(receipt) if p.resolve() not in seen]
+    if missing and not allow_missing:
+        raise ValueError("Partition checkpoint missing input")
+    return missing
+
+
+def partition_days(receipt, root, *, wallets=None):
+    """Resume disjoint completed batches, refusing changed or duplicated input."""
+    missing = _validate_partition_set(receipt, _roots(root), wallets=wallets, allow_missing=True)
     for offset in range(0, len(missing), 4):
         batch = missing[offset:offset + 4]
         output = root / f"{batch[0].parent.name}_{batch[-1].parent.name}"
@@ -96,12 +103,12 @@ def partition_days(receipt, root, *, wallets=None):
     return _roots(root)
 
 
-def freeze_cohorts(history, ledger_paths, ledger_parts):
+def freeze_cohorts(history, ledger_paths, ledger_parts, *, verify_only=False):
     records = _wallet_records(history)
     preliminary = make_cohorts(records, [], cutoff=T)
     edges, evidence, counts = verify_partitioned_ledger(
         ledger_paths, ledger_parts, cutoff=T,
-        proven=preliminary.proven, young=preliminary.unlinked,
+        proven=preliminary.proven, young=preliminary.unlinked, verify_only=verify_only,
     ) if ledger_paths else _empty_ledger()
     frozen = make_cohorts(records, edges, cutoff=T)
     cohorts = {
@@ -198,13 +205,82 @@ def _load_checkpoint(directory):
     return json.loads(path.read_text())
 
 
+# One explicitly reviewed predecessor can be resumed without refreezing.
+# The research and acquisition semantics must remain byte-identical.
+_REVIEWED_CODE = "ed3565187e24756b6d9834b4ef66c3c9153f2e2f9fbb4518944385ee16a7d5c8"
+_REVIEWED_SEMANTICS = {
+    "fills.py": "17d0efbf5587b706f6e7a8fb073881519340d8fcde5881c72db098e6fec15861",
+    "ledger.py": "bebbbfea1402737e5d575012b937187cc3a96f2728da48381623690c3cfe10c0",
+    "cohorts.py": "50d4caf2075decf1027cdc06addf7ae71a089003790559e7fc879346db91fb8e",
+    "study.py": "058ed9e1ced305b37b59eaff0a0e344cdffb838e5a725f6b7d8f32e22efed95d",
+    "acquire.py": "1349d89ea7fa9eece5b153d250b7d70bdac5aeae138336690530174b9383c782",
+}
+
+
+def _validate_frozen(analysis, frozen):
+    if frozen != _load_checkpoint(analysis / "frozen") or _utc(frozen["cutoff"]) != T:
+        raise ValueError("Frozen historical checkpoint changed")
+    if frozen["code_sha256"] == _code_digest():
+        return
+    if frozen["code_sha256"] != _REVIEWED_CODE or any(
+        _sha256(Path(__file__).with_name(name)) != digest
+        for name, digest in _REVIEWED_SEMANTICS.items()
+    ):
+        raise ValueError("Frozen pilot code changed; do not silently refreeze")
+
+
+def _validate_daily_inputs(receipt, name, start, end):
+    seen = set()
+    intervals = []
+    for item in receipt["days"]:
+        day = _utc(item["day"] + "T00:00:00Z")
+        if not start <= day < end or day in seen:
+            raise ValueError("Daily receipt outside frozen interval or duplicated")
+        seen.add(day)
+        path = Path(item["path"])
+        meta = path.parent / "metadata.json"
+        if (_sha256(path) != item["sha256"] or _sha256(meta) != item["metadata_sha256"]
+                or json.loads(meta.read_text())[name] != item["declaration"]):
+            raise ValueError("Historical or forward input checksum mismatch")
+        for pair in item["declaration"]["intervals"]:
+            left, right = map(_utc, pair)
+            if not day <= left < right <= day + DAY:
+                raise ValueError("Daily receipt coverage outside window")
+            intervals.append((left, right))
+    if (_canonical(sorted(set(intervals))) != receipt["declared_intervals"]
+            or receipt["present"] != bool(seen)
+            or receipt["missing_days"] != [d.date().isoformat() for d in _days(start, end) if d not in seen]
+            or receipt["sha256"] != (_digest(receipt["days"]) if seen else None)
+            or receipt["retrieval_id"] != receipt["sha256"]):
+        raise ValueError("Daily receipt aggregate mismatch")
+
+
+def _historical_roots(frozen):
+    roots = []
+    for item in frozen["history_partitions"]:
+        path = Path(item["path"])
+        if _sha256(path / "receipt.json") != item["receipt_sha256"]:
+            raise ValueError("Historical partition receipt changed after freeze")
+        roots.append(path)
+    _validate_partition_set(frozen["history_receipt"], roots)
+    return roots
+
+
 def freeze(root, analysis, retry):
     directory = analysis / "frozen"
     if directory.exists():
         frozen = _load_checkpoint(directory)
-        if frozen["code_sha256"] != _code_digest():
-            raise ValueError("Frozen pilot code changed; do not silently refreeze")
+        _validate_frozen(analysis, frozen)
         return frozen
+    # Recover existing incomplete days before partitioning or freezing. Missing
+    # days remain explicit gaps if standalone historical acquisition failed.
+    for day in _days(ARCHIVE_START, T):
+        fill = select_day(root, day, "fills")
+        extra = retry if day.date().isoformat() == "2026-09-08" else None
+        ledger = select_day(root, day, "ledger", extra=extra) if LEDGER_START <= day else None
+        if fill is not None and (not complete_day(fill[1], day, "fills")
+                                 or (ledger is not None and not complete_day(ledger[1], day, "ledger"))):
+            acquire_day(root, day, ledger_extra=extra)
     history_receipt = daily_receipt(root, "fills", ARCHIVE_START, T)
     ledger_receipt = daily_receipt(root, "ledger", LEDGER_START, T,
                                    replacements={"2026-09-08": retry})
@@ -260,36 +336,39 @@ def _report_from_summary(frozen, forward_receipt, forward, counts, input_counts)
     )
 
 
+def _apply_fill_audit(report, historical, forward):
+    if historical["failed"] or forward["failed"]:
+        report["limitations"].append("Representative normalized fill audit found invalid economics.")
+        if report["status"] == "comparison_available":
+            report["status"] = "partial"
+
+
 def evaluate(root, analysis, frozen):
     directory = analysis / "final"
     # A durable, checksum-verified historical freeze is mandatory before any
     # forward provider request. Never select cohorts from forward records.
-    if frozen != _load_checkpoint(analysis / "frozen") or frozen["code_sha256"] != _code_digest():
-        raise ValueError("Frozen historical checkpoint changed")
+    _validate_frozen(analysis, frozen)
     if directory.exists():
         report = _load_checkpoint(directory)
         if report["manifest"]["frozen_checkpoint_sha256"] != _sha256(analysis / "frozen" / "manifest.json"):
             raise ValueError("Final report does not bind frozen cohort")
         return report
+    _validate_daily_inputs(frozen["history_receipt"], "fills", ARCHIVE_START, T)
+    _validate_daily_inputs(frozen["ledger_receipt"], "ledger", LEDGER_START, T)
+    history_roots = _historical_roots(frozen)
     for day in _days(T, FORWARD_END):
-        for attempt in range(2):
-            try:
-                meta = acquire_day(root, day)
-                item = meta["fills"]["acquisition"]["slices"][0]
-                print("forward receipt", day.date(), item.get("selected_provider"),
-                      item["coverage_complete"], flush=True)
-                break
-            except Exception as exc:
-                print("forward acquisition failed", day.date(), type(exc).__name__, flush=True)
+        try:
+            meta = acquire_day(root, day, analysis=analysis)
+            item = meta["fills"]["acquisition"]["slices"][0]
+            print("forward receipt", day.date(), item.get("selected_provider"),
+                  item["coverage_complete"], flush=True)
+        except SnapshotBudgetExceeded:
+            raise
+        except Exception as exc:
+            print("forward acquisition failed", day.date(), type(exc).__name__, flush=True)
     receipt = daily_receipt(root, "fills", T, FORWARD_END)
     receipt["forward_gaps"] = _gaps(receipt, T, FORWARD_END)
     receipt = _canonical(receipt)
-    history_roots = []
-    for item in frozen["history_partitions"]:
-        path = Path(item["path"])
-        if _sha256(path / "receipt.json") != item["receipt_sha256"]:
-            raise ValueError("Historical partition receipt changed after freeze")
-        history_roots.append(path)
     eligible = sorted(frozen["cohorts"]["linked"] + frozen["cohorts"]["no_observed_link"])
     forward_roots = partition_days(receipt, analysis / "forward-parts", wallets=eligible)
     forward, counts = summarize_partitions(history_roots + forward_roots, analysis / "forward-summary",
@@ -310,36 +389,68 @@ def evaluate(root, analysis, frozen):
     report["manifest"]["historical_fill_audit"] = frozen["historical_fill_audit"]
     sample = [p for p in _paths(receipt) if p.parent.name in {"2026-10-23", "2026-11-07", "2026-11-21"}]
     report["manifest"]["forward_fill_audit"] = _audit_fills(sample)
-    if report["manifest"]["historical_fill_audit"]["failed"] or report["manifest"]["forward_fill_audit"]["failed"]:
-        report["limitations"].append("Representative normalized fill audit found invalid economics.")
-        if report["status"] == "comparison_available":
-            report["status"] = "partial"
+    _apply_fill_audit(report, frozen["historical_fill_audit"],
+                      report["manifest"]["forward_fill_audit"])
     _checkpoint(directory, report)
     return _load_checkpoint(directory)
 
 
 def verify_replay(root, analysis, frozen, report):
     """Reconstruct membership and outcomes from verified private checkpoints."""
-    directory = analysis / "verified"
+    directory = analysis / "verified-v2"
+    _validate_frozen(analysis, frozen)
+    if report != _load_checkpoint(analysis / "final"):
+        raise ValueError("Final report checkpoint changed")
     report_hash = _sha256(analysis / "final" / "manifest.json")
-    if directory.exists():
-        verification = _load_checkpoint(directory)
-        if verification["report_sha256"] != report_hash:
-            raise ValueError("Verification does not bind final report")
-        return verification
-    history, history_counts = combine_summaries(_roots(analysis / "history-summary"))
+    frozen_hash = _sha256(analysis / "frozen" / "manifest.json")
+    if report["manifest"]["frozen_checkpoint_sha256"] != frozen_hash:
+        raise ValueError("Final report does not bind frozen cohort")
+    _validate_daily_inputs(frozen["history_receipt"], "fills", ARCHIVE_START, T)
+    _validate_daily_inputs(frozen["ledger_receipt"], "ledger", LEDGER_START, T)
+    history_roots = _historical_roots(frozen)
+    history, history_counts = summarize_partitions(
+        history_roots, analysis / "history-summary", start=None, end=T,
+        score_start=LEDGER_START, verify_only=True)
     if _canonical(history_counts) != frozen["history_counts"]:
         raise ValueError("Historical diagnostics replay mismatch")
     cohorts, ledger_counts = freeze_cohorts(
-        history, _paths(frozen["ledger_receipt"]), analysis / "ledger-parts")
+        history, _paths(frozen["ledger_receipt"]), analysis / "ledger-parts", verify_only=True)
     if _canonical(cohorts) != frozen["cohorts"] or ledger_counts != frozen["ledger_counts"]:
         raise ValueError("Cohort or ledger replay mismatch")
-    forward, counts = combine_summaries(_roots(analysis / "forward-summary"))
+    if (len(history) != frozen["historical_wallets"]
+            or len(_wallet_records(history)) != frozen["historical_wallets_with_valid_trade_evidence"]):
+        raise ValueError("Historical population replay mismatch")
+    if _audit_edges(_paths(frozen["ledger_receipt"]), cohorts) != frozen["edge_audit"]:
+        raise ValueError("Funding edge audit replay mismatch")
+    historical_sample = [p for p in _paths(frozen["history_receipt"]) if p.parent.name in
+                         {"2026-05-01", "2026-08-24", "2026-10-22"}]
+    if _audit_fills(historical_sample) != frozen["historical_fill_audit"]:
+        raise ValueError("Historical fill audit replay mismatch")
     receipt = daily_receipt(root, "fills", T, FORWARD_END)
     receipt["forward_gaps"] = _gaps(receipt, T, FORWARD_END)
-    replay = _report_from_summary(
-        frozen, _canonical(receipt), forward, counts, report["manifest"]["diagnostics"]["fill_input"])
-    for key in ("comparison", "cohorts", "verified_transfers"):
+    receipt = _canonical(receipt)
+    eligible = sorted(cohorts["linked"] + cohorts["no_observed_link"])
+    forward_roots = _roots(analysis / "forward-parts")
+    _validate_partition_set(receipt, forward_roots, wallets=eligible)
+    forward, counts = summarize_partitions(
+        history_roots + forward_roots, analysis / "forward-summary",
+        start=T, end=FORWARD_END, score_start=T, wallets=eligible, verify_only=True)
+    input_counts = {"invalid_event_time_rows": 0, "forward_invalid_wallet_rows": 0}
+    for source in (frozen["history_receipt"], receipt):
+        if _paths(source):
+            with FillArchive(_paths(source)) as archive:
+                for key, value in archive.input_diagnostics(
+                    forward_start=T, forward_end=FORWARD_END
+                ).items():
+                    input_counts[key] += value
+    replay = _report_from_summary(frozen, receipt, forward, counts, input_counts)
+    forward_sample = [p for p in _paths(receipt) if p.parent.name in
+                      {"2026-10-23", "2026-11-07", "2026-11-21"}]
+    forward_audit = _audit_fills(forward_sample)
+    if forward_audit != report["manifest"]["forward_fill_audit"]:
+        raise ValueError("Forward fill audit replay mismatch")
+    _apply_fill_audit(replay, frozen["historical_fill_audit"], forward_audit)
+    for key in ("status", "limitations", "comparison", "cohorts", "verified_transfers"):
         if replay[key] != report[key]:
             raise ValueError("Outcome replay mismatch")
     for key in ("counts", "diagnostics", "inputs"):
@@ -347,14 +458,19 @@ def verify_replay(root, analysis, frozen, report):
             raise ValueError("Manifest replay mismatch")
     verification = {
         "report_sha256": report_hash,
-        "frozen_sha256": _sha256(analysis / "frozen" / "manifest.json"),
-        "verified_at": datetime.now(timezone.utc),
-        "method": "checksum-verified shard summaries, repeated ledger verification and cohort and outcome reconstruction",
+        "frozen_sha256": frozen_hash,
+        "verification_code_sha256": _code_digest(),
+        "method": "fresh input, partition and summary checksums; repeated ledger verification and cohort and outcome reconstruction",
         "historical_summary_shards": len(_roots(analysis / "history-summary")),
         "forward_summary_shards": len(_roots(analysis / "forward-summary")),
         "cohorts_equal": True, "outcomes_equal": True, "diagnostics_equal": True,
     }
-    _checkpoint(directory, verification)
+    if directory.exists():
+        previous = _load_checkpoint(directory)
+        if {k: v for k, v in previous.items() if k != "verified_at"} != verification:
+            raise ValueError("Fresh verification evidence differs from prior receipt")
+        return previous
+    _checkpoint(directory, {**verification, "verified_at": datetime.now(timezone.utc)})
     return _load_checkpoint(directory)
 
 
@@ -428,7 +544,7 @@ def main(argv=None):
     verification = verify_replay(args.root, args.analysis, frozen, report)
     result = sanitized(report)
     result["verification"] = verification
-    public = args.analysis / "sanitized"
+    public = args.analysis / "sanitized-v2"
     if public.exists():
         if _load_checkpoint(public) != _canonical(result):
             raise ValueError("Sanitized report replay mismatch")
