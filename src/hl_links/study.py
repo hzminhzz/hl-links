@@ -189,7 +189,6 @@ def run_study(
 
     archive = FillArchive(fills_path) if fills_receipt["present"] else None
     try:
-        fill_input_counts = archive.input_diagnostics() if archive else {"invalid_event_time_rows": 0}
         history, history_counts = archive.summarize(
             start=None, end=cutoff, score_start=history_start
         ) if archive else ([], {})
@@ -204,6 +203,9 @@ def run_study(
         # No forward records enter the historical queries or ledger matcher.
         # The only membership input to the next query is the frozen cohort.
         eligible = sorted(frozen.linked | frozen.unlinked)
+        fill_input_counts = archive.input_diagnostics(
+            forward_start=cutoff, forward_end=forward_end
+        ) if archive else {"invalid_event_time_rows": 0, "forward_invalid_wallet_rows": 0}
         forward, forward_counts = archive.summarize(
             start=cutoff, end=forward_end, score_start=cutoff, wallets=eligible
         ) if archive else ([], {})
@@ -213,7 +215,7 @@ def run_study(
 
     forward_by_wallet = {row["wallet"]: row for row in forward}
     coverage_complete = not (
-        fills_receipt["forward_gaps"] or fill_input_counts["invalid_event_time_rows"]
+        fills_receipt["forward_gaps"] or any(fill_input_counts.values())
     )
     comparison = _compare(
         _cohort_scores(cohorts["linked"], forward_by_wallet, coverage_complete=coverage_complete),
@@ -255,6 +257,9 @@ def run_study(
         if counts["invalid_event_time_rows"]:
             limitations.append(f"{name}: missing event timestamps; undated records cannot be assigned to either study window.")
             partial = True
+    if fill_input_counts["forward_invalid_wallet_rows"]:
+        limitations.append("Forward fills: missing wallet identities; unattributable fills make coverage incomplete.")
+        partial = True
     if ledger_counts["unknown_availability_rows"]:
         limitations.append("Ledger availability is unknown for some historical evidence.")
     if any(ledger_counts[key] for key in ("one_sided", "ambiguous", "incompatible", "invalid_rows", "late_known_rows")):

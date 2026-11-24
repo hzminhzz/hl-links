@@ -238,6 +238,24 @@ def test_equal_wallet_weighting_rebates_unknown_fees_and_zero_volume(tmp_path):
     assert report["status"] == "partial"
 
 
+@pytest.mark.parametrize(("pnl", "fee"), [(1000, 0), (0, -10), (10, 10)])
+def test_zero_notional_with_economic_values_invalidates_forward_score(tmp_path, pnl, fee):
+    rows = base_fills() + [
+        fill("y", 90, 1, pnl=pnl, fee=fee, notional=0),
+        fill("idle", 91, -7), fill("idle", 92, 1, notional=0),
+    ]
+    report = snapshot(tmp_path, rows, transfer("tx", "pro", "y"))
+    linked = report["comparison"]["linked"]
+    assert report["cohorts"]["linked"] == ["y"]
+    assert linked["valid"] == 0
+    assert linked["invalid"] == 1
+    assert linked["wallet_scores"]["y"]["status"] == "invalid_economics"
+    assert report["comparison"]["no_observed_link"]["wallet_scores"]["idle"]["status"] == "zero_volume"
+    assert report["manifest"]["diagnostics"]["forward_fills"]["invalid_notional"] == 1
+    assert report["status"] == "inconclusive"
+    assert report["comparison"]["mean_difference"] is None
+
+
 def test_missing_and_partial_snapshots_are_explicit(tmp_path):
     absent = snapshot(tmp_path / "absent", base_fills(), None)
     assert absent["status"] == "inconclusive"
@@ -285,6 +303,27 @@ def test_missing_forward_coverage_is_not_inactivity(tmp_path):
     assert partial["comparison"]["no_observed_link"]["valid"] == 1
 
 
+def test_unattributable_forward_fills_are_counted_before_cohort_filter(tmp_path):
+    rows = base_fills() + [fill("idle", 90, -7)]
+    ledger = transfer("tx", "pro", "y")
+    original = snapshot(tmp_path / "original", rows, ledger)
+    changed = snapshot(tmp_path / "changed", rows + [
+        fill(None, 91, 0, pnl=-100),
+        fill("  ", 92, 29, pnl=-100),
+        fill("\t\n", 95, 1, pnl=-100),
+        fill(None, 93, 30, pnl=-100),  # Outside the forward window.
+        fill(None, 94, 1, symbol="@1"),  # Outside market scope.
+    ], ledger)
+    assert changed["cohorts"] == original["cohorts"]
+    assert changed["manifest"]["diagnostics"]["fill_input"]["forward_invalid_wallet_rows"] == 3
+    assert changed["comparison"]["linked"]["mean"] == 10
+    control = changed["comparison"]["no_observed_link"]
+    assert control["wallet_scores"]["idle"]["status"] == "missing_data"
+    assert not control["coverage_complete"]
+    assert changed["status"] == "partial"
+    assert any("wallet identities" in text for text in changed["limitations"])
+
+
 @pytest.mark.parametrize("bad_source", ["fills", "ledger"])
 def test_undated_records_are_disclosed_and_cannot_enter_a_window(tmp_path, bad_source):
     rows = base_fills() + [fill("idle", 90, -7)]
@@ -305,6 +344,31 @@ def test_undated_records_are_disclosed_and_cannot_enter_a_window(tmp_path, bad_s
     )
     assert report["status"] == "partial"
     assert any("event timestamps" in text for text in report["limitations"])
+
+
+@pytest.mark.parametrize("known_offset, rejected", [(-1, True), (0, True), (1, False), (None, False)])
+def test_undated_conflicting_transfer_respects_cutoff_availability(tmp_path, known_offset, rejected):
+    rows = base_fills()
+    ledger = transfer("tx", "pro", "y")
+    baseline = snapshot(tmp_path / "baseline", rows, ledger)
+    conflict = transfer(
+        "TX", "pro", "c", event_at=None,
+        known_at=None if known_offset is None else T + known_offset * DAY,
+    )[:1]
+    changed = snapshot(tmp_path / "changed", rows, ledger + conflict)
+    counts = changed["manifest"]["diagnostics"]["ledger"]
+    assert counts["invalid_event_time_rows"] == 1
+    assert counts["undated_conflicting_transactions"] == int(rejected)
+    if rejected:
+        assert changed["cohorts"]["linked"] == []
+        assert changed["cohorts"]["no_observed_link"] == ["c", "y"]
+        assert changed["cohorts"]["links"] == []
+        assert counts["ambiguous"] == 1
+        assert changed["status"] == "inconclusive"
+    else:
+        assert changed["cohorts"] == baseline["cohorts"]
+        assert counts["ambiguous"] == 0
+        assert changed["status"] == "partial"
 
 
 @pytest.fixture

@@ -14,6 +14,9 @@ _MAIN_PERP = """
     AND NOT regexp_matches(symbol, '[@#/:]')
 """
 
+# Normalize the same ASCII whitespace for identity checks and cohort joins.
+_WALLET = "lower(trim(wallet, ' ' || chr(9) || chr(10) || chr(11) || chr(12) || chr(13)))"
+
 # Deduplicate by wallet/trade ID plus the actual economic event, never by
 # source receipt timestamps. Conflicting variants invalidate the affected wallet.
 _SUMMARY = f"""
@@ -21,7 +24,7 @@ WITH params AS (
     SELECT ?::TIMESTAMPTZ AS start_at, ?::TIMESTAMPTZ AS end_at,
            ?::TIMESTAMPTZ AS score_start, ?::VARCHAR[] AS wallets
 ), visible AS (
-    SELECT lower(trim(wallet)) AS wallet, trim(trade_id::VARCHAR) AS trade_id,
+    SELECT {_WALLET} AS wallet, trim(trade_id::VARCHAR) AS trade_id,
            event_at, known_at, ingested_at, upper(trim(symbol)) AS symbol,
            try_cast(closed_pnl_usd AS DECIMAL(38,12)) AS pnl,
            try_cast(fee_amount AS DECIMAL(38,12)) AS fee,
@@ -33,7 +36,7 @@ WITH params AS (
       -- use event time, including fills captured after the forward window.
       AND (start_at IS NOT NULL OR known_at IS NULL OR known_at <= end_at)
       AND ({_MAIN_PERP})
-      AND (wallets IS NULL OR list_contains(wallets, lower(trim(wallet))))
+      AND (wallets IS NULL OR list_contains(wallets, {_WALLET}))
 ), variants AS (
     SELECT wallet, trade_id, event_at, symbol, pnl, fee, fee_unit, notional,
            min(known_at) AS known_at, min(ingested_at) AS first_ingested_at,
@@ -41,11 +44,11 @@ WITH params AS (
     FROM visible
     GROUP BY wallet, trade_id, event_at, symbol, pnl, fee, fee_unit, notional
 ), earlier_keys AS (
-    SELECT DISTINCT lower(trim(wallet)) AS wallet, trim(trade_id::VARCHAR) AS trade_id
+    SELECT DISTINCT {_WALLET} AS wallet, trim(trade_id::VARCHAR) AS trade_id
     FROM fill_input, params
     WHERE start_at IS NOT NULL AND event_at < start_at
       AND ({_MAIN_PERP})
-      AND (wallets IS NULL OR list_contains(wallets, lower(trim(wallet))))
+      AND (wallets IS NULL OR list_contains(wallets, {_WALLET}))
 ), checked AS (
     SELECT variants.*,
            count(*) OVER (PARTITION BY wallet, trade_id) AS variants,
@@ -54,9 +57,10 @@ WITH params AS (
            fee_unit IS DISTINCT FROM 'USD' OR fee IS NULL AS bad_fee,
            pnl IS NULL AS bad_pnl,
            -- An observed historical trade must have positive notional.
-           -- Forward zero-volume outcomes remain explicitly undefined.
+           -- A zero-volume forward row cannot carry realized PnL or fees.
            notional IS NULL OR notional < 0
-               OR (start_at IS NULL AND notional = 0) AS bad_notional,
+               OR (notional = 0 AND (start_at IS NULL OR pnl <> 0 OR fee <> 0))
+               AS bad_notional,
            event_at >= score_start AS in_score
     FROM variants LEFT JOIN earlier_keys USING (wallet, trade_id), params
 )
@@ -75,7 +79,8 @@ SELECT wallet, min(event_at) AS first_trade_at, max(event_at) AS last_trade_at,
        count(*) FILTER (WHERE in_score AND bad_pnl) AS invalid_pnl,
        count(*) FILTER (WHERE bad_notional) AS invalid_notional,
        coalesce(sum(pnl - fee) FILTER (
-           WHERE in_score AND NOT bad_key AND variants = 1 AND NOT bad_fee AND NOT bad_pnl
+           WHERE in_score AND NOT bad_key AND variants = 1
+             AND NOT bad_notional AND NOT bad_fee AND NOT bad_pnl
        ), 0) AS net_pnl,
        coalesce(sum(notional) FILTER (
            WHERE in_score AND NOT bad_key AND variants = 1 AND NOT bad_notional
@@ -117,12 +122,21 @@ class FillArchive:
     def __exit__(self, *_):
         self.close()
 
-    def input_diagnostics(self) -> dict:
-        # Undated records cannot be attributed to either window; count them once.
-        count = self.connection.execute(
-            "SELECT count(*) FROM fill_input WHERE event_at IS NULL"
-        ).fetchone()[0]
-        return {"invalid_event_time_rows": count}
+    def input_diagnostics(self, *, forward_start: datetime, forward_end: datetime) -> dict:
+        # Count unattributable records before the eligible-wallet filter. Undated
+        # records cannot be attributed to either window; count them once.
+        undated, invalid_wallets = self.connection.execute(f"""
+            SELECT count(*) FILTER (WHERE event_at IS NULL),
+                   count(*) FILTER (
+                       WHERE event_at >= ? AND event_at < ? AND ({_MAIN_PERP})
+                         AND ({_WALLET} IS NULL OR {_WALLET} = '')
+                   )
+            FROM fill_input
+        """, [forward_start, forward_end]).fetchone()
+        return {
+            "invalid_event_time_rows": undated,
+            "forward_invalid_wallet_rows": invalid_wallets,
+        }
 
     def summarize(
         self, *, start: datetime | None, end: datetime, score_start: datetime,
@@ -138,7 +152,7 @@ class FillArchive:
                    count(*) FILTER (WHERE ({_MAIN_PERP}) AND known_at > ?)
             FROM fill_input
             WHERE (?::TIMESTAMPTZ IS NULL OR event_at >= ?) AND event_at < ?
-              AND (?::VARCHAR[] IS NULL OR list_contains(?::VARCHAR[], lower(trim(wallet))))
+              AND (?::VARCHAR[] IS NULL OR list_contains(?::VARCHAR[], {_WALLET}))
         """, [end, start, start, end, wallets, wallets]).fetchone()
         counters = (
             "observed_variants", "duplicate_rows", "conflicting_keys", "cross_window_conflicting_keys", "invalid_keys",

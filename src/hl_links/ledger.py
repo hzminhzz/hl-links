@@ -32,7 +32,8 @@ def verify_transfers(path: Path | None, cutoff: datetime):
     counts = Counter({
         key: 0 for key in (
             "rows", "duplicate_rows", "late_known_rows", "unknown_availability_rows",
-            "invalid_rows", "invalid_event_time_rows", "one_sided", "ambiguous", "non_direct",
+            "invalid_rows", "invalid_event_time_rows", "undated_conflicting_transactions",
+            "one_sided", "ambiguous", "non_direct",
             "intermediary", "self", "incompatible", "below_minimum", "verified",
         )
     })
@@ -45,9 +46,16 @@ def verify_transfers(path: Path | None, cutoff: datetime):
     for field in ("event_at", "known_at", "ingested_at"):
         if not isinstance(schema[field], pl.Datetime) or schema[field].time_zone is None:
             raise ValueError(f"Ledger {field} must be timezone-aware")
-    counts["invalid_event_time_rows"] = scan.select(
-        pl.col("event_at").is_null().sum()
-    ).collect().item()
+    undated = scan.filter(pl.col("event_at").is_null()).select(
+        "transaction_id", "known_at"
+    ).collect()
+    counts["invalid_event_time_rows"] = undated.height
+    # Only demonstrably cutoff-known undated evidence may invalidate a
+    # historical transaction. Later or unanchored rows are diagnostics only.
+    undated_known = {
+        tx for raw in undated.filter(pl.col("known_at") <= cutoff)["transaction_id"]
+        if (tx := _normalized(raw))
+    }
     data = scan.select(sorted(_REQUIRED)).filter(
         (pl.col("event_at") >= cutoff - timedelta(days=60))
         & (pl.col("event_at") < cutoff)
@@ -77,6 +85,10 @@ def verify_transfers(path: Path | None, cutoff: datetime):
         if key in groups[tx]:
             counts["duplicate_rows"] += 1
         groups[tx][key].add(evidence)
+
+    undated_conflicts = undated_known.intersection(groups)
+    counts["undated_conflicting_transactions"] = len(undated_conflicts)
+    invalid_transactions.update(undated_conflicts)
 
     edges = []
     evidence_by_tx = {}
