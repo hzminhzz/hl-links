@@ -18,3 +18,4 @@ dist/
 *.sqlite-*
 *.duckdb
 *.duckdb.wal
+*.parquet

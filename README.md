@@ -40,4 +40,44 @@ uv sync --group dev
 uv run pytest
 ```
 
-**State:** The first study has not been implemented or executed. The initial `src/hl_links/cohorts.py` still contains pre-grill rules (`$5K` profit threshold and transfers without a `$100` minimum) and must be aligned with these approved decisions during implementation. All findings remain exploratory; no trading authorization or production integration.
+## Local study runner (T01)
+
+Run from the project root with normalized, immutable Parquet snapshots in `data/` and write the private report under `runs/`:
+
+```bash
+uv run --locked python -m hl_links.study \
+  --fills data/fills.parquet --ledger data/ledger.parquet \
+  --metadata data/coverage.json --output runs/pilot.json
+```
+
+The default cutoff is the approved October 23 UTC pilot. `--cutoff` accepts an explicit timezone-aware ISO-8601 value for reproducible fixture experiments.
+
+**Normalized inputs:** timestamps must be timezone-aware; `known_at` and `ingested_at` may be null rather than fabricated. Numeric money columns must be in the stated units.
+
+| Snapshot | Required columns |
+| --- | --- |
+| Fills | `wallet`, `trade_id`, `event_at`, `known_at`, `ingested_at`, `dex_name` (HL for main venue), `symbol`, `closed_pnl_usd`, `fee_amount` (signed), `fee_unit`, `notional_usd` (absolute traded notional) |
+| Ledger | `transaction_id`, `wallet`, `counterparty` (nullable), `direction` (out/in), `transfer_type` (send for confirmed direct external transfers), `intermediary` (boolean), `event_at`, `known_at`, `ingested_at`, `amount_usd`, `source` |
+
+The runner accepts USD-normalized fees only; an adapter may normalize fees only with supported conversion evidence. Unknown units invalidate affected profit scores, not fabricate USD conversion. Fills are deduplicated by wallet/trade identity and economics; conflicting identities invalidate affected eligibility or forward scores. Ledger transactions require exactly two compatible distinct opposite sides; a missing counterparty can qualify only when the other evidence uniquely identifies both sides. Providers must classify internal transfers and intermediary events before normalization.
+
+Example coverage metadata (illustrative, not verified live coverage):
+
+```json
+{
+  "fills": {
+    "source": "fixture",
+    "retrieval_id": "fixture-fills-v1",
+    "intervals": [["2026-07-25T00:00:00Z", "2026-11-22T00:00:00Z"]]
+  },
+  "ledger": {
+    "source": "fixture",
+    "retrieval_id": "fixture-ledger-v1",
+    "intervals": [["2026-08-24T00:00:00Z", "2026-10-23T00:00:00Z"]]
+  }
+}
+```
+
+Intervals describe actual producer-verified coverage, not minimum/maximum timestamps of sparse rows. Use opaque retrieval identities without credentials. Input SHA-256s and code digest, declared coverage and gaps, cohort membership, transfer evidence, per-wallet outcomes, counts and limitations are recorded in the JSON report. Missing input paths, unresolved economics and coverage gaps are disclosed; an absent valid denominator produces an inconclusive result. A comparison with declared coverage gaps or invalid economics is partial. The nominal descriptive interval is not cluster-aware evidence of skill.
+
+**State:** T01 implements the deterministic local-fixture pipeline. Vendor acquisition and the actual historical pilot belong to T02 and T03. All findings remain exploratory; no trading authorization or production integration.

@@ -1,11 +1,12 @@
 """Cutoff-safe screening for a wallet funding-link hypothesis.
 
 This module intentionally does not query live exchanges or calculate returns.
-Consumers must supply archival records with verifiable availability timestamps.
+Consumers supply deduplicated archival summaries and verified direct transfers.\nUnknown availability is permitted only for retrospective reconstruction.
 """
 
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
+from decimal import Decimal
 from typing import Iterable
 
 
@@ -14,8 +15,8 @@ class WalletRecord:
     address: str
     first_trade_at: datetime
     last_trade_at: datetime
-    net_realized_pnl_usd: float
-    known_at: datetime
+    net_realized_pnl_usd: Decimal | float | None
+    known_at: datetime | None
 
 
 @dataclass(frozen=True, slots=True)
@@ -23,10 +24,11 @@ class MoneyTransfer:
     sender: str
     recipient: str
     event_at: datetime
-    known_at: datetime
-    amount_usd: float
+    known_at: datetime | None
+    amount_usd: Decimal | float
     direct: bool = True
     intermediary: bool = False
+    transaction_id: str = ""
 
 
 @dataclass(frozen=True, slots=True)
@@ -34,6 +36,7 @@ class Cohorts:
     proven: frozenset[str]
     linked: frozenset[str]
     unlinked: frozenset[str]
+    links: tuple[MoneyTransfer, ...] = ()
 
 
 def _utc(value: datetime) -> datetime:
@@ -50,16 +53,16 @@ def _address(value: str) -> str:
 
 
 def eligible_proven(record: WalletRecord, cutoff: datetime) -> bool:
-    """Proven trader: 60+ day trading history and >= $5K pre-cutoff net PnL."""
+    """Proven trader: 60+ observed days and >= $20K pre-cutoff net PnL."""
     t = _utc(cutoff)
     first = _utc(record.first_trade_at)
     last = _utc(record.last_trade_at)
-    known = _utc(record.known_at)
     return (
-        known <= t
-        and first <= last <= t
+        (record.known_at is None or _utc(record.known_at) <= t)
+        and first <= last < t
         and t - first >= timedelta(days=60)
-        and record.net_realized_pnl_usd >= 5_000
+        and record.net_realized_pnl_usd is not None
+        and record.net_realized_pnl_usd >= 20_000
     )
 
 
@@ -68,11 +71,10 @@ def eligible_young(record: WalletRecord, cutoff: datetime) -> bool:
     t = _utc(cutoff)
     first = _utc(record.first_trade_at)
     last = _utc(record.last_trade_at)
-    known = _utc(record.known_at)
     age = t - first
     return (
-        known <= t
-        and first <= last <= t
+        (record.known_at is None or _utc(record.known_at) <= t)
+        and first <= last < t
         and timedelta(days=7) <= age < timedelta(days=60)
         and t - last <= timedelta(days=7)
     )
@@ -94,17 +96,24 @@ def make_cohorts(
     proven = {_address(r.address) for r in records if eligible_proven(r, t)}
     young = {_address(r.address) for r in records if eligible_young(r, t)}
     linked: set[str] = set()
+    links: list[MoneyTransfer] = []
 
     for transfer in transfers:
-        if transfer.intermediary or not transfer.direct or transfer.amount_usd <= 0:
+        if transfer.intermediary or not transfer.direct or transfer.amount_usd < 100:
             continue
-        if _utc(transfer.event_at) > t or _utc(transfer.known_at) > t:
+        if not t - timedelta(days=60) <= _utc(transfer.event_at) < t:
+            continue
+        if transfer.known_at is not None and _utc(transfer.known_at) > t:
             continue
         sender = _address(transfer.sender)
         recipient = _address(transfer.recipient)
+        if sender == recipient:
+            continue
         if sender in proven and recipient in young:
             linked.add(recipient)
-        if recipient in proven and sender in young:
+            links.append(transfer)
+        elif recipient in proven and sender in young:
             linked.add(sender)
+            links.append(transfer)
 
-    return Cohorts(frozenset(proven), frozenset(linked), frozenset(young - linked))
+    return Cohorts(frozenset(proven), frozenset(linked), frozenset(young - linked), tuple(links))
