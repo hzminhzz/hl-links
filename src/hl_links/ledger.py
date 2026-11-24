@@ -62,20 +62,33 @@ def verify_transfers(path: Path | None, cutoff: datetime):
     schema = scan.collect_schema()
     if missing := _REQUIRED - set(schema.names()):
         raise ValueError(f"Missing ledger columns: {sorted(missing)}")
-    for field in ("event_at", "known_at", "ingested_at"):
+    window_fields = {"source_window_start", "source_window_end"}
+    present_window_fields = window_fields & set(schema.names())
+    if present_window_fields and present_window_fields != window_fields:
+        raise ValueError("Ledger source-window bounds must be supplied together")
+    for field in ("event_at", "known_at", "ingested_at", *sorted(present_window_fields)):
         if not isinstance(schema[field], pl.Datetime) or schema[field].time_zone is None:
             raise ValueError(f"Ledger {field} must be timezone-aware")
     undated = scan.filter(pl.col("event_at").is_null()).select(
-        "transaction_id", "known_at"
+        "transaction_id", "known_at", *sorted(present_window_fields)
     ).collect()
     counts["invalid_event_time_rows"] = undated.height
-    # Only demonstrably cutoff-known undated evidence may invalidate a
-    # historical transaction. Later or unanchored rows are diagnostics only.
+    # A wholly pre-cutoff historical request can anchor contradictory
+    # undated evidence for rejection only, never establish its event time
+    # or historical availability. Later/straddling/unanchored requests
+    # cannot change cutoff-frozen transfer identities.
+    historical_conflict = pl.col("known_at") <= cutoff
+    if present_window_fields:
+        historical_conflict = historical_conflict.fill_null(False) | (
+            pl.col("known_at").is_null()
+            & (pl.col("source_window_start") < pl.col("source_window_end"))
+            & (pl.col("source_window_end") <= cutoff)
+        )
     undated_known = {
-        tx for raw in undated.filter(pl.col("known_at") <= cutoff)["transaction_id"]
+        tx for raw in undated.filter(historical_conflict)["transaction_id"]
         if (tx := _normalized(raw))
     }
-    optional = {"token", "window_complete"} & set(schema.names())
+    optional = ({"token", "window_complete"} & set(schema.names())) | present_window_fields
     data = scan.select(sorted(_REQUIRED | optional)).filter(
         (pl.col("event_at") >= cutoff - timedelta(days=60))
         & (pl.col("event_at") < cutoff)
@@ -107,7 +120,8 @@ def verify_transfers(path: Path | None, cutoff: datetime):
             _normalized(row["transfer_type"]), row["intermediary"], row["event_at"], amount,
             _normalized(row.get("token")),
         )
-        evidence = (source, row["known_at"], row["ingested_at"])
+        evidence = (source, row["known_at"], row["ingested_at"],
+                    row.get("source_window_start"), row.get("source_window_end"))
         if key in groups[tx]:
             counts["duplicate_rows"] += 1
         groups[tx][key].add(evidence)
@@ -156,8 +170,10 @@ def verify_transfers(path: Path | None, cutoff: datetime):
 
         def observations(side):
             return [
-                {"source": source, "known_at": known, "ingested_at": ingested}
-                for source, known, ingested in sorted(
+                {"source": source, "known_at": known, "ingested_at": ingested,
+                 **({"source_window_start": window_start, "source_window_end": window_end}
+                    if present_window_fields else {})}
+                for source, known, ingested, window_start, window_end in sorted(
                     sides[side], key=lambda item: tuple(str(value) for value in item)
                 )
             ]

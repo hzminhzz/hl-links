@@ -88,15 +88,24 @@ def _archive_query(provider):
     else:
         raise ValueError("Unknown archive provider")
     wallet, ts, symbol, market, qty, pnl, notional = fields
+    whitespace = "' ' || chr(9) || chr(10) || chr(11) || chr(12) || chr(13)"
+    symbol_value = f"nullif(upper(trim({symbol}, {whitespace})), '')"
+    market_value = f"nullif(upper(trim({market}, {whitespace})), '')"
+    # A known non-main DEX or spot/HIP-3 symbol excludes the row. Missing
+    # classification fields otherwise leave a potentially main-perp fill.
+    could_be_main = (
+        f"coalesce({market_value}, {dex}) = {dex} "
+        f"AND NOT coalesce(regexp_matches({symbol}, '[@#/:]'), false)"
+    )
     # Source schemas identify UTC; DuckDB's session is explicitly UTC below.
     # Null event timestamps remain diagnostics instead of disappearing in a filter.
     return f"""
         SELECT
-            CASE WHEN regexp_full_match(lower(trim({wallet}, ' ' || chr(9) || chr(10) || chr(11) || chr(12) || chr(13))), '0x[0-9a-f]{{40}}')
-                 THEN lower(trim({wallet}, ' ' || chr(9) || chr(10) || chr(11) || chr(12) || chr(13))) END AS wallet,
+            CASE WHEN regexp_full_match(lower(trim({wallet}, {whitespace})), '0x[0-9a-f]{{40}}')
+                 THEN lower(trim({wallet}, {whitespace})) END AS wallet,
             trade_id::VARCHAR AS trade_id, {ts}::TIMESTAMPTZ AS event_at,
             NULL::TIMESTAMPTZ AS known_at, ?::TIMESTAMPTZ AS ingested_at,
-            'HL'::VARCHAR AS dex_name, upper(trim({symbol})) AS symbol,
+            'HL'::VARCHAR AS dex_name, {symbol_value} AS symbol,
             try_cast({pnl} AS DOUBLE) AS closed_pnl_usd,
             try_cast(fee AS DOUBLE) AS fee_amount, upper(trim(fee_token)) AS fee_unit,
             CASE WHEN {notional_matches_sql(qty, "price", notional)}
@@ -104,11 +113,11 @@ def _archive_query(provider):
                  THEN try_cast({notional} AS DOUBLE) END AS notional_usd,
             lower(trim(side)) AS side, {qty}::DOUBLE AS quantity,
             price::DOUBLE AS price, '{provider}' AS source,
+            ({market_value} IS NULL OR {symbol_value} IS NULL) AS unclassified_market,
             count(*)::BIGINT AS source_rows
         FROM read_parquet(?)
         WHERE ({ts} IS NULL OR ({ts} >= ? AND {ts} < ?))
-          AND upper(trim({market})) = {dex}
-          AND trim({symbol}) <> '' AND NOT regexp_matches({symbol}, '[@#/:]')
+          AND ({could_be_main})
         GROUP BY ALL
     """
 
@@ -126,6 +135,8 @@ _LEDGER_SCHEMA = {
     "ingested_at": pl.Datetime("us", "UTC"), "amount_usd": pl.String,
     "source": pl.String, "token": pl.String, "signed_amount_usd": pl.String,
     "window_complete": pl.Boolean,
+    "source_window_start": pl.Datetime("us", "UTC"),
+    "source_window_end": pl.Datetime("us", "UTC"),
 }
 
 
@@ -144,23 +155,28 @@ def _read_slice(con, table, provider, archive, window):
     # Capture completion, not a fabricated historical receipt.
     captured = _now()
     con.execute(f"UPDATE {table} SET ingested_at = ?", [captured])
-    count, invalid, duplicates, invalid_rows = con.execute(
-        f"SELECT count(*), count(*) FILTER (WHERE event_at IS NULL), "
-        f"coalesce(sum(source_rows - 1), 0), "
-        f"count(*) FILTER (WHERE wallet IS NULL OR trade_id IS NULL OR trade_id = '' "
-        f"OR notional_usd IS NULL OR NOT coalesce(isfinite(closed_pnl_usd), false) "
-        f"OR NOT coalesce(isfinite(fee_amount), false) OR fee_unit IS NULL OR fee_unit = '') "
-        f"FROM {table}"
-    ).fetchone()
+    count, invalid, duplicates, invalid_rows, unclassified = con.execute(f"""
+        SELECT count(*) FILTER (WHERE NOT unclassified_market),
+               count(*) FILTER (WHERE NOT unclassified_market AND event_at IS NULL),
+               coalesce(sum(source_rows - 1) FILTER (WHERE NOT unclassified_market), 0),
+               count(*) FILTER (WHERE NOT unclassified_market AND (
+                   wallet IS NULL OR trade_id IS NULL OR trade_id = ''
+                   OR notional_usd IS NULL OR NOT coalesce(isfinite(closed_pnl_usd), false)
+                   OR NOT coalesce(isfinite(fee_amount), false) OR fee_unit IS NULL OR fee_unit = ''
+               )),
+               coalesce(sum(source_rows) FILTER (WHERE unclassified_market), 0)
+        FROM {table}
+    """).fetchone()
     conflicting_keys = con.execute(
-        f"SELECT count(*) FROM (SELECT wallet, trade_id FROM {table} GROUP BY ALL HAVING count(*) > 1)"
+        f"SELECT count(*) FROM (SELECT wallet, trade_id FROM {table} "
+        "WHERE NOT unclassified_market GROUP BY ALL HAVING count(*) > 1)"
     ).fetchone()[0]
-    con.execute(f"ALTER TABLE {table} DROP COLUMN source_rows")
     return {"provider": provider, "window": window.pair(),
             "source_date": window.start.date().isoformat(), "identity": identity,
             "retrieved_at": captured.isoformat(), "rows": count,
             "raw_file_rows": raw_rows, "undated_rows": invalid, "duplicate_rows": duplicates,
-            "invalid_rows": invalid_rows, "conflicting_keys": conflicting_keys}
+            "invalid_rows": invalid_rows, "conflicting_keys": conflicting_keys,
+            "unclassified_market_rows": unclassified}
 
 
 def _error(exc):
@@ -170,28 +186,52 @@ def _error(exc):
     return str(exc) if isinstance(exc, SourceUnavailable) else type(exc).__name__
 
 
-def _reconcile(con):
+def _economic_differences(*, allow_missing_symbol=False):
+    fields = ("event_at", "side", "fee_unit")
+    symbol_diff = "a.symbol IS DISTINCT FROM b.symbol"
+    if allow_missing_symbol:
+        symbol_diff = f"(a.symbol IS NOT NULL AND ({symbol_diff}))"
+    return " OR ".join(
+        [symbol_diff] + [f"a.{field} IS DISTINCT FROM b.{field}" for field in fields]
+        + [f"""CASE WHEN isfinite(a.{field}) AND isfinite(b.{field})
+                    THEN abs(a.{field} - b.{field}) >
+                         greatest(1e-8, 1e-9 * greatest(abs(a.{field}), abs(b.{field})))
+                    ELSE a.{field} IS DISTINCT FROM b.{field} END"""
+           for field in ("quantity", "price", "notional_usd", "closed_pnl_usd", "fee_amount")]
+    )
+
+
+def _reconcile(con, *, unclassified_market_rows):
     """Reconcile keys and economics without unioning the two providers."""
     keys = "wallet, trade_id"
     economics = "event_at, symbol, side, quantity, price, notional_usd, closed_pnl_usd, fee_amount, fee_unit"
-    differs = " OR ".join(
-        [f"a.{field} IS DISTINCT FROM b.{field}" for field in ("event_at", "symbol", "side", "fee_unit")]
-        + [f"(a.{field} IS NULL) <> (b.{field} IS NULL) OR "
-           f"abs(a.{field} - b.{field}) > greatest(1e-8, 1e-9 * greatest(abs(a.{field}), abs(b.{field})))"
-           for field in ("quantity", "price", "notional_usd", "closed_pnl_usd", "fee_amount")]
-    )
+    differs = _economic_differences()
     counts = con.execute(f"""
         WITH a AS (SELECT *, row_number() OVER (PARTITION BY {keys} ORDER BY {economics}) AS variant
-                   FROM primary_slice),
+                   FROM primary_slice WHERE NOT unclassified_market),
              b AS (SELECT *, row_number() OVER (PARTITION BY {keys} ORDER BY {economics}) AS variant
-                   FROM check_slice)
+                   FROM check_slice WHERE NOT unclassified_market)
         SELECT count(*) FILTER (WHERE a.variant IS NOT NULL AND b.variant IS NOT NULL),
                count(*) FILTER (WHERE a.variant IS NOT NULL AND b.variant IS NULL),
                count(*) FILTER (WHERE b.variant IS NOT NULL AND a.variant IS NULL),
                count(*) FILTER (WHERE a.variant IS NOT NULL AND b.variant IS NOT NULL AND ({differs}))
         FROM a FULL OUTER JOIN b USING (wallet, trade_id, variant)
     """).fetchone()
-    return dict(zip(("matched", "vike_only", "reservoir_only", "economic_discrepancies"), counts, strict=True))
+    result = dict(zip(("matched", "vike_only", "reservoir_only", "economic_discrepancies"), counts, strict=True))
+    # A larger Reservoir slice is not necessarily the missing evidence.
+    # Every unclassified primary identity must have compatible economics in
+    # the clean replacement; never guess the market or silently drop a row.
+    result["unresolved_market_rows"] = 0
+    if unclassified_market_rows:
+        result["unresolved_market_rows"] = con.execute(f"""
+            SELECT coalesce(sum(a.source_rows), 0) FROM primary_slice a
+            WHERE a.unclassified_market AND NOT EXISTS (
+                SELECT 1 FROM check_slice b
+                WHERE NOT b.unclassified_market AND a.wallet = b.wallet AND a.trade_id = b.trade_id
+                  AND NOT ({_economic_differences(allow_missing_symbol=True)})
+            )
+        """).fetchone()[0]
+    return result
 
 
 def _hex_identifier(value, digits):
@@ -265,7 +305,11 @@ def _fetch_ledger(window, page, *, limit, max_pages, seen, rows):
         receipt["pages"] += 1
         receipt["raw_rows"] += len(items)
         receipt["retrieved_at"] = captured.isoformat()
-        if not items:
+        next_cursor = data.get("nextCursor")
+        # Vike's observed terminal response is an empty page echoing the
+        # requested cursor. A new cursor must be followed even on empty pages;
+        # cycling to any older cursor or echoing a nonempty page is invalid.
+        if not items and (next_cursor in (None, "") or next_cursor == cursor):
             receipt["pagination_exhausted"] = True
             break
         for item in items:
@@ -287,8 +331,8 @@ def _fetch_ledger(window, page, *, limit, max_pages, seen, rows):
             seen.add(key)
             rows.append(row)
             receipt["retained_rows"] += 1
-        cursor = data.get("nextCursor")
-        if not isinstance(cursor, str) or not cursor or cursor in cursors:
+        cursor = next_cursor
+        if not isinstance(cursor, str) or not cursor.strip() or cursor in cursors:
             receipt["error"] = "missing_or_repeated_cursor"
             break
         cursors.add(cursor)
@@ -300,6 +344,8 @@ def _fetch_ledger(window, page, *, limit, max_pages, seen, rows):
                            if receipt["pagination_exhausted"] else "page_budget_exhausted")
     for row in rows[first_row:]:
         row["window_complete"] = receipt["complete"]
+        row["source_window_start"] = window.start
+        row["source_window_end"] = window.end
     return receipt
 
 
@@ -307,7 +353,7 @@ def _covered_slice(receipt):
     # An empty main-perp slice is not evidence of inactivity. Fall back and
     # retain a coverage gap if neither source supplies trustworthy observations.
     return receipt["rows"] > 0 and not any(
-        receipt[key] for key in ("undated_rows", "invalid_rows", "conflicting_keys")
+        receipt[key] for key in ("undated_rows", "invalid_rows", "conflicting_keys", "unclassified_market_rows")
     )
 
 
@@ -327,15 +373,17 @@ def _select_fill_slice(con, window, vike_archive, reservoir_archive, reconcile):
             return receipt, "primary_slice", covered
         try:
             check = _read_slice(con, "check_slice", "reservoir", reservoir_archive, window)
-            differences = _reconcile(con)
+            differences = _reconcile(con, unclassified_market_rows=primary["unclassified_market_rows"])
             receipt["reconciliation"] = {"source": check, **differences}
-            if (_covered_slice(check) and differences["reservoir_only"]
-                    and not differences["vike_only"] and not differences["economic_discrepancies"]):
+            if (_covered_slice(check)
+                    and (differences["reservoir_only"] or primary["unclassified_market_rows"])
+                    and not differences["vike_only"] and not differences["economic_discrepancies"]
+                    and not differences["unresolved_market_rows"]):
                 receipt["selected_provider"] = "reservoir"
                 receipt["selection_reason"] = "clean_reservoir_superset"
                 return receipt, "check_slice", True
             if not _covered_slice(check) or any(differences[k] for k in (
-                "vike_only", "reservoir_only", "economic_discrepancies",
+                "vike_only", "reservoir_only", "economic_discrepancies", "unresolved_market_rows",
             )):
                 covered = False
         except (SourceUnavailable, OSError, TimeoutError, duckdb.Error) as exc:
@@ -431,7 +479,8 @@ def acquire_snapshots(output_dir, fill_windows, ledger_windows, *, connection,
             )
             if table is not None:
                 stager.add("fills", lambda path: con.execute(
-                    f"COPY {table} TO ? (FORMAT PARQUET, COMPRESSION ZSTD)", [str(path)],
+                    f"COPY (SELECT * EXCLUDE (source_rows, unclassified_market) FROM {table} "
+                    "WHERE NOT unclassified_market) TO ? (FORMAT PARQUET, COMPRESSION ZSTD)", [str(path)],
                 ))
             for name in ("primary_slice", "check_slice"):
                 con.execute(f"DROP TABLE IF EXISTS {name}")
