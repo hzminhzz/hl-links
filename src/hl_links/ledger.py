@@ -32,7 +32,7 @@ def verify_transfers(path: Path | None, cutoff: datetime):
     counts = Counter({
         key: 0 for key in (
             "rows", "duplicate_rows", "late_known_rows", "unknown_availability_rows",
-            "invalid_rows", "one_sided", "ambiguous", "non_direct",
+            "invalid_rows", "invalid_event_time_rows", "one_sided", "ambiguous", "non_direct",
             "intermediary", "self", "incompatible", "below_minimum", "verified",
         )
     })
@@ -45,6 +45,9 @@ def verify_transfers(path: Path | None, cutoff: datetime):
     for field in ("event_at", "known_at", "ingested_at"):
         if not isinstance(schema[field], pl.Datetime) or schema[field].time_zone is None:
             raise ValueError(f"Ledger {field} must be timezone-aware")
+    counts["invalid_event_time_rows"] = scan.select(
+        pl.col("event_at").is_null().sum()
+    ).collect().item()
     data = scan.select(sorted(_REQUIRED)).filter(
         (pl.col("event_at") >= cutoff - timedelta(days=60))
         & (pl.col("event_at") < cutoff)

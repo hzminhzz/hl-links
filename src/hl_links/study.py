@@ -6,6 +6,7 @@ from decimal import Decimal
 import hashlib
 import json
 import math
+import os
 from pathlib import Path
 import statistics
 
@@ -18,6 +19,12 @@ from .ledger import verify_transfers
 
 PILOT_CUTOFF = datetime(2026, 10, 23, tzinfo=timezone.utc)
 DAY = timedelta(days=1)
+_TRADE_ISSUES = ("invalid_keys", "conflicting_keys", "cross_window_conflicting_keys", "invalid_notional")
+_PNL_ISSUES = ("unknown_fees", "invalid_pnl")
+
+
+def _has_issues(row: dict, keys: tuple[str, ...]) -> bool:
+    return any(row.get(key, 0) for key in keys)
 
 
 def _utc(value: str | datetime) -> datetime:
@@ -86,32 +93,33 @@ def _wallet_records(rows: list[dict]) -> list[WalletRecord]:
     return [
         WalletRecord(
             row["wallet"], row["first_trade_at"], row["last_trade_at"],
-            None if row["unknown_fees"] or row["invalid_pnl"] else row["net_pnl"],
+            None if _has_issues(row, _PNL_ISSUES) else row["net_pnl"],
             row["known_at"],
         )
         for row in rows
-        if not row["invalid_keys"] and not row["conflicting_keys"]
+        if not _has_issues(row, _TRADE_ISSUES)
     ]
 
 
-def _cohort_scores(wallets: list[str], forward: dict[str, dict]) -> dict:
+def _cohort_scores(wallets: list[str], forward: dict[str, dict], *, coverage_complete: bool) -> dict:
     results = {}
     scores = []
-    forward_trading = zero_volume = invalid = unknown_fee_wallets = 0
+    forward_trading = zero_volume = missing_data = invalid = unknown_fee_wallets = 0
     for wallet in wallets:
         row = forward.get(wallet)
         if row:
             forward_trading += 1
             unknown_fee_wallets += bool(row["unknown_fees"])
-        if row and any(row[key] for key in (
-            "invalid_keys", "conflicting_keys", "cross_window_conflicting_keys",
-            "invalid_notional", "invalid_pnl", "unknown_fees"
-        )):
+        if row and _has_issues(row, _TRADE_ISSUES + _PNL_ISSUES):
             invalid += 1
             results[wallet] = {"status": "invalid_economics", "score": None}
         elif row is None or row["notional"] == 0:
-            zero_volume += 1
-            results[wallet] = {"status": "zero_volume", "score": None}
+            if coverage_complete:
+                zero_volume += 1
+                results[wallet] = {"status": "zero_volume", "score": None}
+            else:
+                missing_data += 1
+                results[wallet] = {"status": "missing_data", "score": None}
         else:
             score = float(100 * row["net_pnl"] / row["notional"])
             scores.append(score)
@@ -124,6 +132,8 @@ def _cohort_scores(wallets: list[str], forward: dict[str, dict]) -> dict:
         "forward_trading": forward_trading,
         "valid": len(scores),
         "zero_volume": zero_volume,
+        "missing_data": missing_data,
+        "coverage_complete": coverage_complete,
         "invalid": invalid,
         "unknown_fee_wallets": unknown_fee_wallets,
         "mean": statistics.fmean(scores) if scores else None,
@@ -179,6 +189,7 @@ def run_study(
 
     archive = FillArchive(fills_path) if fills_receipt["present"] else None
     try:
+        fill_input_counts = archive.input_diagnostics() if archive else {"invalid_event_time_rows": 0}
         history, history_counts = archive.summarize(
             start=None, end=cutoff, score_start=history_start
         ) if archive else ([], {})
@@ -201,9 +212,12 @@ def run_study(
             archive.close()
 
     forward_by_wallet = {row["wallet"]: row for row in forward}
+    coverage_complete = not (
+        fills_receipt["forward_gaps"] or fill_input_counts["invalid_event_time_rows"]
+    )
     comparison = _compare(
-        _cohort_scores(cohorts["linked"], forward_by_wallet),
-        _cohort_scores(cohorts["no_observed_link"], forward_by_wallet),
+        _cohort_scores(cohorts["linked"], forward_by_wallet, coverage_complete=coverage_complete),
+        _cohort_scores(cohorts["no_observed_link"], forward_by_wallet, coverage_complete=coverage_complete),
     )
     limitations = [
         "Retrospectively reconstructed; ingestion is not historical availability.",
@@ -213,6 +227,8 @@ def run_study(
         "Equal-wallet weighting; descriptive normal interval, when available, is not cluster-aware or causal inference.",
         "Coverage intervals and retrieval identities are declared by the snapshot producer, not independently certified.",
     ]
+    if not coverage_complete:
+        limitations.append("Forward coverage incomplete: zero observed volume is missing data, and positive-volume scores describe observed fills only.")
     partial = False
     for name, receipt in (("fills", fills_receipt), ("ledger", ledger_receipt)):
         if not receipt["present"]:
@@ -228,14 +244,17 @@ def run_study(
         if counts.get("unknown_availability"):
             limitations.append(f"{name}: unknown historical availability is retained only as retrospective evidence.")
         if counts.get("late_known_rows"):
-            limitations.append(f"{name}: explicitly later-known rows excluded.")
-        if any(counts.get(key) for key in ("unknown_fees", "invalid_pnl", "invalid_keys", "conflicting_keys",
-                                               "cross_window_conflicting_keys")):
-            limitations.append(f"{name}: unresolved fee units, economics or fill identities; affected scores or eligibility excluded.")
+            if name == "historical fills":
+                limitations.append("Historical fills: explicitly later-known rows excluded.")
+            else:
+                limitations.append("Forward fills: later-known rows included by event time in retrospective outcomes.")
+        if _has_issues(counts, _TRADE_ISSUES + _PNL_ISSUES):
+            limitations.append(f"{name}: unresolved fee units, economics, traded notional or fill identities; affected scores or eligibility excluded.")
             partial = True
-    if forward_counts.get("invalid_notional"):
-        limitations.append("Forward fills have unresolved traded notional; affected scores excluded.")
-        partial = True
+    for name, counts in (("Fill input", fill_input_counts), ("Ledger input", ledger_counts)):
+        if counts["invalid_event_time_rows"]:
+            limitations.append(f"{name}: missing event timestamps; undated records cannot be assigned to either study window.")
+            partial = True
     if ledger_counts["unknown_availability_rows"]:
         limitations.append("Ledger availability is unknown for some historical evidence.")
     if any(ledger_counts[key] for key in ("one_sided", "ambiguous", "incompatible", "invalid_rows", "late_known_rows")):
@@ -267,12 +286,16 @@ def run_study(
                 "young_max_age_days_exclusive": 60,
                 "transfer_min_usd": 100,
                 "forward_days": 30,
+                "historical_availability_policy": "exclude explicitly later-known records",
+                "forward_outcome_policy": "event time regardless of later availability",
+                "historical_notional_policy": "positive notional required for trade evidence",
                 "fee_policy": "signed USD only; no implicit non-USD conversion",
                 "fill_money_decimal_places": 12,
                 "weighting": "equal wallet",
             },
             "inputs": {"fills": fills_receipt, "ledger": ledger_receipt},
             "diagnostics": {
+                "fill_input": fill_input_counts,
                 "historical_fills": history_counts,
                 "forward_fills": forward_counts,
                 "ledger": ledger_counts,
@@ -299,17 +322,29 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--ledger", type=Path, help="Normalized local ledger Parquet")
     parser.add_argument("--metadata", type=Path, required=True, help="Source coverage JSON")
     parser.add_argument("--cutoff", type=_utc, default=PILOT_CUTOFF)
-    parser.add_argument("--output", type=Path, required=True, help="Private run JSON (use runs/)")
+    parser.add_argument("--output", type=Path, required=True, help="New private run JSON under runs/")
     args = parser.parse_args(argv)
-    # An output must never replace a source snapshot or its coverage declaration.
+    # Keep raw reports inside the checkout's ignored private directory. Resolve
+    # symlinks before checking the boundary; never replace an existing inode.
+    private_root = Path(__file__).resolve().parents[2] / "runs"
+    output = args.output.resolve()
+    if output == private_root or not output.is_relative_to(private_root):
+        parser.error("--output must be inside the project's runs/ directory")
     inputs = [path.resolve() for path in (args.fills, args.ledger, args.metadata)
               if path is not None]
-    if args.output.resolve() in inputs:
-        parser.error("--output must not overwrite any input")
+    if output in inputs or output.exists():
+        parser.error("--output must be a new file, not an existing input or artifact")
     metadata = json.loads(args.metadata.read_text(encoding="utf-8"))
     report = run_study(args.fills, args.ledger, metadata, cutoff=args.cutoff)
-    args.output.parent.mkdir(parents=True, exist_ok=True)
-    args.output.write_text(json.dumps(report, sort_keys=True, indent=2) + "\n", encoding="utf-8")
+    output.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    if output.parent.resolve() != output.parent:
+        parser.error("--output parent changed during the run")
+    try:
+        fd = os.open(output, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    except FileExistsError:
+        parser.error("--output already exists")
+    with os.fdopen(fd, "w", encoding="utf-8") as stream:
+        stream.write(json.dumps(report, sort_keys=True, indent=2) + "\n")
     return 0
 
 

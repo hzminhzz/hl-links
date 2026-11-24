@@ -7,6 +7,7 @@ import hashlib
 import json
 import subprocess
 import sys
+from tempfile import TemporaryDirectory
 
 import polars as pl
 import pytest
@@ -96,6 +97,24 @@ def test_local_runner_compares_cutoff_frozen_wallets(tmp_path):
         "2026-10-23T00:00:00Z", "2026-11-22T00:00:00Z"]
 
 
+def test_forward_outcome_uses_event_time_even_when_known_later(tmp_path):
+    original = snapshot(tmp_path / "original", base_fills(), transfer("tx", "pro", "y"))
+    rows = base_fills() + [
+        fill("y", 90, 1, pnl=-100, known_at=T+31*DAY),
+        fill("y", 91, 30, pnl=1_000_000, known_at=T+31*DAY),
+        fill("late_winner", 92, -70, known_at=T+DAY),
+        fill("late_winner", 93, -1, pnl=20_000, known_at=T+DAY),
+    ]
+    changed = snapshot(tmp_path / "changed", rows, transfer("tx", "pro", "y"))
+    assert changed["cohorts"] == original["cohorts"]
+    assert changed["comparison"]["linked"]["mean"] == -45
+    assert changed["comparison"]["mean_difference"] == -40
+    assert changed["manifest"]["diagnostics"]["forward_fills"]["late_known_rows"] == 1
+    assert changed["manifest"]["diagnostics"]["historical_fills"]["late_known_rows"] == 2
+    assert changed["status"] == "comparison_available"
+    assert any("included" in text and "later-known" in text for text in changed["limitations"])
+
+
 def test_forward_reused_historical_fill_identity_cannot_count_twice(tmp_path):
     original = snapshot(tmp_path / "original", base_fills(), transfer("tx", "pro", "y"))
     rows = base_fills() + [fill("y", 3, 1, pnl=10000)]
@@ -133,6 +152,25 @@ def test_market_history_and_forward_boundaries(tmp_path):
     assert report["comparison"]["no_observed_link"]["mean"] == -5
     assert report["manifest"]["diagnostics"]["historical_fills"]["excluded_market_rows"] == 5
     assert report["manifest"]["diagnostics"]["historical_fills"]["late_known_rows"] == 2
+
+
+@pytest.mark.parametrize("bad_notional", [-100, 0, None])
+def test_invalid_historical_notional_cannot_establish_wallet_eligibility(tmp_path, bad_notional):
+    rows = base_fills() + [
+        fill("fake", 90, -7, notional=bad_notional),
+        fill("fake", 91, 1, pnl=50),
+        # Even an older invalid fill makes the observed-age evidence uncertain.
+        fill("old_bad", 92, -70, notional=bad_notional),
+        fill("old_bad", 93, -7, pnl=20_000),
+        fill("recent_bad", 94, -20),
+        fill("recent_bad", 95, -1, notional=bad_notional),
+    ]
+    report = snapshot(tmp_path, rows, transfer("tx", "pro", "y"))
+    assert report["cohorts"]["proven"] == ["pro"]
+    assert report["cohorts"]["no_observed_link"] == ["c"]
+    assert report["comparison"]["no_observed_link"]["mean"] == -5
+    assert report["manifest"]["diagnostics"]["historical_fills"]["invalid_notional"] == 3
+    assert report["status"] == "partial"
 
 
 def test_transfer_verification_rejects_nonqualifying_evidence(tmp_path):
@@ -221,7 +259,91 @@ def test_missing_and_partial_snapshots_are_explicit(tmp_path):
         ["2026-10-23T00:00:00Z", "2026-10-24T00:00:00Z"]]
 
 
-def test_runner_repeatable_and_cli_matches_api(tmp_path):
+def test_missing_forward_coverage_is_not_inactivity(tmp_path):
+    rows = [row for row in base_fills() if row["trade_id"] != "6"] + [
+        fill("zero", 90, -7), fill("zero", 91, 2, notional=0),
+    ]
+    incomplete = metadata()
+    incomplete["fills"]["intervals"] = [
+        [(T-90*DAY).isoformat(), T.isoformat()],
+        [(T+DAY).isoformat(), (T+30*DAY).isoformat()],
+    ]
+    partial = snapshot(tmp_path / "partial", rows, transfer("tx", "pro", "y"),
+                       provenance=incomplete)
+    complete = snapshot(tmp_path / "complete", rows, transfer("tx", "pro", "y"))
+    for group, wallet in (("linked", "y"), ("no_observed_link", "zero")):
+        uncertain = partial["comparison"][group]
+        assert uncertain["wallet_scores"][wallet]["status"] == "missing_data"
+        assert uncertain["missing_data"] == 1
+        assert uncertain["zero_volume"] == 0
+        known = complete["comparison"][group]
+        assert known["wallet_scores"][wallet]["status"] == "zero_volume"
+        assert known["zero_volume"] == 1
+        assert known["missing_data"] == 0
+    assert partial["status"] == "inconclusive"
+    assert partial["comparison"]["mean_difference"] is None
+    assert partial["comparison"]["no_observed_link"]["valid"] == 1
+
+
+@pytest.mark.parametrize("bad_source", ["fills", "ledger"])
+def test_undated_records_are_disclosed_and_cannot_enter_a_window(tmp_path, bad_source):
+    rows = base_fills() + [fill("idle", 90, -7)]
+    ledger = transfer("tx", "pro", "y")
+    if bad_source == "fills":
+        rows.append(fill("y", 91, 1, pnl=-100, event_at=None))
+    else:
+        ledger += transfer("undated", "pro", "c", event_at=None)
+    report = snapshot(tmp_path, rows, ledger)
+    assert report["cohorts"]["linked"] == ["y"]
+    assert report["cohorts"]["no_observed_link"] == ["c", "idle"]
+    assert report["comparison"]["linked"]["mean"] == 10
+    diagnostics = report["manifest"]["diagnostics"]
+    assert diagnostics["fill_input"]["invalid_event_time_rows"] == (1 if bad_source == "fills" else 0)
+    assert diagnostics["ledger"]["invalid_event_time_rows"] == (2 if bad_source == "ledger" else 0)
+    assert report["comparison"]["no_observed_link"]["wallet_scores"]["idle"]["status"] == (
+        "missing_data" if bad_source == "fills" else "zero_volume"
+    )
+    assert report["status"] == "partial"
+    assert any("event timestamps" in text for text in report["limitations"])
+
+
+@pytest.fixture
+def private_run_dir():
+    root = Path(__file__).resolve().parents[1] / "runs"
+    root.mkdir(exist_ok=True)
+    with TemporaryDirectory(prefix="t01-cli-", dir=root) as path:
+        yield Path(path)
+
+
+@pytest.mark.parametrize("kind", ["hardlink", "existing", "outside", "symlink_parent"])
+def test_cli_refuses_unsafe_output(tmp_path, private_run_dir, kind):
+    snapshot(private_run_dir, base_fills(), transfer("tx", "pro", "y"))
+    fills_path = private_run_dir / "fills.parquet"
+    ledger_path = private_run_dir / "ledger.parquet"
+    meta_path = private_run_dir / "metadata.json"
+    meta_path.write_text(json.dumps(metadata()))
+    output = private_run_dir / "report.json"
+    if kind == "hardlink":
+        output.hardlink_to(fills_path)
+    elif kind == "existing":
+        output.write_text("existing private artifact")
+    elif kind == "outside":
+        output = tmp_path / "report.json"
+    else:
+        escape = private_run_dir / "escape"
+        escape.symlink_to(tmp_path, target_is_directory=True)
+        output = escape / "report.json"
+    before = output.read_bytes() if output.exists() else None
+    source_bytes = fills_path.read_bytes()
+    result = subprocess.run([sys.executable, "-m", "hl_links.study", "--fills", str(fills_path),
+                             "--ledger", str(ledger_path), "--metadata", str(meta_path),
+                             "--output", str(output)], capture_output=True)
+    assert result.returncode != 0
+    assert fills_path.read_bytes() == source_bytes
+    assert (output.read_bytes() if output.exists() else None) == before
+
+
+def test_runner_repeatable_and_cli_matches_api(tmp_path, private_run_dir):
     rows = base_fills() + [fill("y", 40, 2, pnl=1, known_at=None)]
     ledger = transfer("tx", "pro", "y", known_at=None)
     first = snapshot(tmp_path, rows, ledger)
@@ -236,11 +358,12 @@ def test_runner_repeatable_and_cli_matches_api(tmp_path):
     assert first["manifest"]["diagnostics"]["ledger"]["unknown_availability_rows"] == 2
     meta_path = tmp_path / "metadata.json"
     meta_path.write_text(json.dumps(metadata()))
-    output = tmp_path / "report.json"
+    output = private_run_dir / "report.json"
     subprocess.run([sys.executable, "-m", "hl_links.study", "--fills", str(fills_path),
                     "--ledger", str(ledger_path), "--metadata", str(meta_path),
                     "--output", str(output)], check=True)
     assert json.loads(output.read_text()) == first
+    assert output.stat().st_mode & 0o777 == 0o600
     before = fills_path.read_bytes()
     refused = subprocess.run([sys.executable, "-m", "hl_links.study",
                               "--fills", str(fills_path), "--metadata", str(meta_path),

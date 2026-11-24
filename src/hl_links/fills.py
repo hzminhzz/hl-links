@@ -29,7 +29,9 @@ WITH params AS (
            try_cast(notional_usd AS DECIMAL(38,12)) AS notional
     FROM fill_input, params
     WHERE (start_at IS NULL OR event_at >= start_at) AND event_at < end_at
-      AND (known_at IS NULL OR known_at <= end_at)
+      -- Historical eligibility is availability-bounded. Retrospective outcomes
+      -- use event time, including fills captured after the forward window.
+      AND (start_at IS NOT NULL OR known_at IS NULL OR known_at <= end_at)
       AND ({_MAIN_PERP})
       AND (wallets IS NULL OR list_contains(wallets, lower(trim(wallet))))
 ), variants AS (
@@ -42,7 +44,6 @@ WITH params AS (
     SELECT DISTINCT lower(trim(wallet)) AS wallet, trim(trade_id::VARCHAR) AS trade_id
     FROM fill_input, params
     WHERE start_at IS NOT NULL AND event_at < start_at
-      AND (known_at IS NULL OR known_at <= start_at)
       AND ({_MAIN_PERP})
       AND (wallets IS NULL OR list_contains(wallets, lower(trim(wallet))))
 ), checked AS (
@@ -52,7 +53,10 @@ WITH params AS (
            trade_id IS NULL OR trade_id = '' OR wallet IS NULL OR wallet = '' AS bad_key,
            fee_unit IS DISTINCT FROM 'USD' OR fee IS NULL AS bad_fee,
            pnl IS NULL AS bad_pnl,
-           notional IS NULL OR notional < 0 AS bad_notional,
+           -- An observed historical trade must have positive notional.
+           -- Forward zero-volume outcomes remain explicitly undefined.
+           notional IS NULL OR notional < 0
+               OR (start_at IS NULL AND notional = 0) AS bad_notional,
            event_at >= score_start AS in_score
     FROM variants LEFT JOIN earlier_keys USING (wallet, trade_id), params
 )
@@ -69,7 +73,7 @@ SELECT wallet, min(event_at) AS first_trade_at, max(event_at) AS last_trade_at,
        count(*) FILTER (WHERE in_score) AS score_fills,
        count(*) FILTER (WHERE in_score AND bad_fee) AS unknown_fees,
        count(*) FILTER (WHERE in_score AND bad_pnl) AS invalid_pnl,
-       count(*) FILTER (WHERE in_score AND bad_notional) AS invalid_notional,
+       count(*) FILTER (WHERE bad_notional) AS invalid_notional,
        coalesce(sum(pnl - fee) FILTER (
            WHERE in_score AND NOT bad_key AND variants = 1 AND NOT bad_fee AND NOT bad_pnl
        ), 0) AS net_pnl,
@@ -112,6 +116,13 @@ class FillArchive:
 
     def __exit__(self, *_):
         self.close()
+
+    def input_diagnostics(self) -> dict:
+        # Undated records cannot be attributed to either window; count them once.
+        count = self.connection.execute(
+            "SELECT count(*) FROM fill_input WHERE event_at IS NULL"
+        ).fetchone()[0]
+        return {"invalid_event_time_rows": count}
 
     def summarize(
         self, *, start: datetime | None, end: datetime, score_start: datetime,
