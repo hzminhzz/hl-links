@@ -129,6 +129,10 @@ uv run --locked python -m hl_links.pilot_run \
 
 The runner resumes the completed stages, acquires the 30-day forward period only after a valid freeze, evaluates the frozen cohorts, and performs reproducibility verification. If a final report already exists, the same command checks it and runs fresh verification without reacquiring completed forward days. No separate verification-only CLI is required for an existing final report.
 
+### Stop an optional replay
+
+The final report and previously published verification receipts are immutable. If a fresh replay must be stopped, terminate only its dedicated terminal session (for the final review run, `tmux kill-session -t hl-links-t03-final-review`). Confirm no matching pilot process remains, and check whether the current code-digest-suffixed verification receipt was published. Do not delete completed artifacts or treat an interrupted run as successful. Resume only with explicit operator approval; the staged command above reuses the existing frozen and final inputs. The November 25 final-review replay was stopped and has no new successful receipt.
+
 ## 4. Monitor without exposing private data
 
 From the original checkout:

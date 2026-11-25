@@ -50,4 +50,8 @@ Representative audits: 24/24 qualifying funding edges reconciled against ledger 
 
 Private artifacts are preserved at `runs/t03-pilot/`, `runs/t03-ledger-retry-0908/` and `runs/t03-analysis/`. The hardened verification and aggregate machine-readable report are in `verified-v2/manifest.json` and `sanitized-v2/manifest.json` below the analysis directory. Raw wallet-level evidence, source receipts, credentials and signed URLs are excluded from Git. See the [operator guide](t03-operator-guide.md) for safe reproduction.
 
-**Disposition:** T03's declared pilot is complete, with a partial/inconclusive scientific comparison. No production changes or branch merge are part of this acceptance.
+## Final review follow-up (2026-11-25)
+
+The six final review findings were addressed in `bdd609b726943c41ff79c33a15e362da68bf8f93`. The full regression suite passed 93/93 in 21.57 seconds and the original freeze passed compatibility validation. The final live replay was subsequently stopped at the operator's request. At 04:10:44 UTC on November 25, no pilot verification process remained and no new code-versioned verification receipt existed. The interruption does not invalidate the earlier successful v2 replay or the original research result. It also does not constitute successful real-data verification of the latest code. Do not describe the latest revision as live-replay verified.
+
+**Disposition:** T03's declared pilot is complete, with a partial/inconclusive scientific comparison. Final review fixes have regression evidence; their fresh real-data replay remains incomplete. No production changes or branch merge are part of this acceptance.

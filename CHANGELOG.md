@@ -4,12 +4,15 @@ Changes to the independent Hyperliquid funding-link research project. Entries de
 
 ## Unreleased — T03 final review fixes (2026-11-25)
 
+Implementation: `bdd609b726943c41ff79c33a15e362da68bf8f93`.
+
 - Resume from complete replacements of previously partitioned incomplete days, retaining superseded unpublished artifacts and reusing unaffected batches and summaries.
 - Produce an inconclusive report for missing historical evidence; the September 8 replacement provenance is conditional.
 - Bind forward acquisition to its own frozen run and historical lineage through a shared checkpoint boundary, removing the acquisition-to-orchestration import.
 - Apply private DuckDB resource configuration and disk headroom to legacy partition validation and representative audits.
 - Preserve earlier verification receipts when compatible code changes; replay published input selections rather than silently selecting later recoveries.
-- Regression suite: 93 passed; original freeze accepted by the new code. The original study thresholds and completed report remain unchanged.
+- Regression suite: 93 passed in 21.57 seconds; original freeze accepted by the new code. The original study thresholds and completed report remain unchanged.
+- Final real-data replay under this revision was stopped at the operator's request. On November 25, 2026 at 04:10:44 UTC, no pilot verification process remained and no new code-versioned verification receipt existed. The earlier successful v2 receipt remains the accepted real-data evidence; this revision has not completed a live replay. No branch merge or new trading authorization.
 
 ## T03 checkpoint hardening (2026-11-25)
 
