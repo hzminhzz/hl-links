@@ -13,7 +13,7 @@ from tempfile import TemporaryDirectory
 import duckdb
 
 from .fills import FillArchive, SUMMARY_COUNTERS, _WALLET, summary_details
-from .resources import SPILL_LIMIT_BYTES, configure_duckdb, private_runs_dir, require_disk_headroom
+from .resources import SPILL_LIMIT_BYTES, bounded_duckdb, configure_duckdb, private_runs_dir, require_disk_headroom
 from .ledger import verify_transfers
 from .study import _sha256, _json_default
 
@@ -23,6 +23,18 @@ def _write_json(path, value):
         json.dump(value, stream, default=_json_default, sort_keys=True, indent=2, allow_nan=False)
         stream.write("\n")
     path.chmod(0o600)
+
+
+def archive_checkpoint(directory):
+    """Retain a superseded, unpublished checkpoint outside the active set."""
+    directory = Path(directory)
+    digest = _sha256(directory / "receipt.json")
+    archive = directory.parent / ".superseded" / f"{directory.name}-{digest}"
+    archive.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    if archive.exists():
+        raise FileExistsError(archive)
+    directory.rename(archive)
+    return archive
 
 
 def wallet_digest(wallets):
@@ -54,8 +66,7 @@ def validate_partition_contract(root, receipt, key):
         if receipt["rows"] != 0:
             raise ValueError("Legacy partition contract row mismatch")
         return
-    with duckdb.connect() as con:
-        con.execute("SET threads=4")
+    with bounded_duckdb() as con:
         rows, wrong = con.execute(f"""
             SELECT count(*), count(*) FILTER (WHERE hash({key}) % ? != bucket)
             FROM read_parquet(?, hive_partitioning=true)
@@ -143,7 +154,8 @@ def _partition_inputs(roots, *, hashes=None, key=FILL_KEY):
     return by_bucket
 
 
-def summarize_shard(paths, output, *, start, end, score_start, wallets=None, expected_hashes=None):
+def summarize_shard(paths, output, *, start, end, score_start, wallets=None,
+                    expected_hashes=None, resume_updates=False):
     """Materialize the exact T01 result and a safe diagnostic receipt."""
     output = Path(output)
     request = json.loads(json.dumps({
@@ -159,11 +171,15 @@ def summarize_shard(paths, output, *, start, end, score_start, wallets=None, exp
         raise ValueError("Partition shard checksum mismatch")
     if output.exists():
         receipt = json.loads((output / "receipt.json").read_text())
-        if receipt.get("request") != request:
-            raise ValueError("Summary checkpoint inputs or query changed")
         if receipt.get("summary_sha256") != _sha256(output / "summary.parquet"):
             raise ValueError("Summary checkpoint checksum mismatch")
-        return
+        if receipt.get("request") == request:
+            return
+        old_query = {k: v for k, v in receipt["request"].items() if k != "inputs"}
+        new_query = {k: v for k, v in request.items() if k != "inputs"}
+        if not resume_updates or old_query != new_query:
+            raise ValueError("Summary checkpoint inputs or query changed")
+        archive_checkpoint(output)
     output.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
     require_disk_headroom(private_runs_dir(), SPILL_LIMIT_BYTES)
     require_disk_headroom(output.parent, SPILL_LIMIT_BYTES + sum(p.stat().st_size for p in paths))
@@ -210,7 +226,8 @@ def combine_summaries(outputs):
     return rows, summary_details(rows, diagnostics)
 
 
-def summarize_partitions(roots, output, *, start, end, score_start, wallets=None, verify_only=False):
+def summarize_partitions(roots, output, *, start, end, score_start, wallets=None,
+                         verify_only=False, resume_updates=False):
     hashes = {}
     shards = _partition_inputs(roots, hashes=hashes)
     outputs = []
@@ -219,11 +236,19 @@ def summarize_partitions(roots, output, *, start, end, score_start, wallets=None
         if verify_only and not part.is_dir():
             raise ValueError("Missing summary checkpoint")
         summarize_shard(paths, part, start=start, end=end, score_start=score_start,
-                        wallets=wallets, expected_hashes=hashes)
+                        wallets=wallets, expected_hashes=hashes,
+                        resume_updates=resume_updates and not verify_only)
         outputs.append(part)
         print("summary checkpoint", part.name, flush=True)
-    if verify_only and set(Path(output).glob("bucket-*")) != set(outputs):
+    obsolete = set(Path(output).glob("bucket-*")) - set(outputs)
+    if obsolete and verify_only:
         raise ValueError("Unexpected summary checkpoint")
+    if resume_updates and not verify_only:
+        for part in sorted(obsolete):
+            receipt = json.loads((part / "receipt.json").read_text())
+            if receipt["summary_sha256"] != _sha256(part / "summary.parquet"):
+                raise ValueError("Summary checkpoint checksum mismatch")
+            archive_checkpoint(part)
     return combine_summaries(outputs) if outputs else ([], summary_details([], (0, 0)))
 
 

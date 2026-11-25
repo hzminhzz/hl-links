@@ -2,7 +2,16 @@
 
 Changes to the independent Hyperliquid funding-link research project. Entries describe engineering milestones, not releases to production or claims of scientific qualification. The project remains on the MVP feature branch.
 
-## Unreleased — T03 checkpoint hardening (2026-11-25)
+## Unreleased — T03 final review fixes (2026-11-25)
+
+- Resume from complete replacements of previously partitioned incomplete days, retaining superseded unpublished artifacts and reusing unaffected batches and summaries.
+- Produce an inconclusive report for missing historical evidence; the September 8 replacement provenance is conditional.
+- Bind forward acquisition to its own frozen run and historical lineage through a shared checkpoint boundary, removing the acquisition-to-orchestration import.
+- Apply private DuckDB resource configuration and disk headroom to legacy partition validation and representative audits.
+- Preserve earlier verification receipts when compatible code changes; replay published input selections rather than silently selecting later recoveries.
+- Regression suite: 93 passed; original freeze accepted by the new code. The original study thresholds and completed report remain unchanged.
+
+## T03 checkpoint hardening (2026-11-25)
 
 Implementation: `10b343bfbd473c44cf89de473caaccc344cd3cc6`.
 

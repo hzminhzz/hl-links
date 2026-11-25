@@ -1,7 +1,11 @@
 """Local research resource limits; never spill data into an unignored directory."""
 
+from contextlib import contextmanager
 from pathlib import Path
 import shutil
+from tempfile import TemporaryDirectory
+
+import duckdb
 
 GIB = 1024**3
 MEMORY_LIMIT = "4GiB"
@@ -37,6 +41,17 @@ def configure_duckdb(connection, spill_dir):
 def require_disk_headroom(path, additional_bytes=0):
     if shutil.disk_usage(path).free < MIN_FREE_DISK_BYTES + additional_bytes:
         raise SnapshotBudgetExceeded("private snapshot disk headroom exhausted")
+
+
+@contextmanager
+def bounded_duckdb():
+    """Read-only analytical queries with private spill and the standard budget."""
+    root = private_runs_dir()
+    require_disk_headroom(root, SPILL_LIMIT_BYTES)
+    with TemporaryDirectory(prefix=".query-", dir=root) as spill:
+        with duckdb.connect() as con:
+            configure_duckdb(con, spill)
+            yield con
 
 
 def duckdb_budget():

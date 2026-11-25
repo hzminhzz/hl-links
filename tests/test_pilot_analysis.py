@@ -79,6 +79,28 @@ def test_summary_and_combine_require_disk_headroom(tmp_path, monkeypatch):
         combine_summaries([output / "bucket-000"])
 
 
+def test_legacy_validation_and_audits_require_disk_headroom(tmp_path, monkeypatch):
+    from hl_links import resources
+    from hl_links.pilot_analysis import FILL_KEY, validate_partition_contract
+    from hl_links.pilot_run import _audit_edges, _audit_fills
+
+    source = tmp_path / "fills.parquet"
+    pl.DataFrame(base_fills(), schema=FILL_SCHEMA).write_parquet(source)
+    parts = tmp_path / "parts"
+    partition_fills([source], parts, buckets=1)
+    record = json.loads((parts / "receipt.json").read_text())
+    del record["partition_contract"]
+    usage = resources.shutil.disk_usage
+    monkeypatch.setattr(resources.shutil, "disk_usage",
+                        lambda path: usage(path)._replace(free=0))
+    with pytest.raises(resources.SnapshotBudgetExceeded):
+        validate_partition_contract(parts, record, FILL_KEY)
+    with pytest.raises(resources.SnapshotBudgetExceeded):
+        _audit_fills([source])
+    with pytest.raises(resources.SnapshotBudgetExceeded):
+        _audit_edges([source], {"links": [{"transaction_id": "fixture"}]})
+
+
 def test_partition_contract_rejects_changed_hash_semantics(tmp_path):
     source = tmp_path / "fills.parquet"
     pl.DataFrame(base_fills(), schema=FILL_SCHEMA).write_parquet(source)
@@ -230,6 +252,86 @@ def test_ledger_shards_match_complete_transaction_evidence(tmp_path):
     assert retained == {"tx1": evidence["tx1"]}
 
 
+def test_recovered_day_reuses_unaffected_partitions_and_summaries(tmp_path):
+    from hl_links import pilot_run as runner
+
+    root, analysis = tmp_path / "days", tmp_path / "analysis"
+    parts, summaries = analysis / "history-parts", analysis / "history-summary"
+    old_day, stable_day = T - 7 * DAY, T - 20 * DAY
+
+    def capture(directory, day, rows, complete):
+        directory.mkdir(parents=True)
+        pl.DataFrame(rows, schema=FILL_SCHEMA).write_parquet(directory / "fills.parquet")
+        pl.DataFrame([], schema=LEDGER_SCHEMA).write_parquet(directory / "ledger.parquet")
+        metadata = {key: {"intervals": [[day.isoformat(), (day + DAY).isoformat()]]
+                          if complete or key == "ledger" else [],
+                          "acquisition": {"slices": [{"coverage_complete": complete or key == "ledger"}]}}
+                    for key in ("fills", "ledger")}
+        (directory / "metadata.json").write_text(json.dumps(metadata))
+
+    stable, old = (root / day.date().isoformat() for day in (stable_day, old_day))
+    capture(stable, stable_day, [fill("y", 3, -20)], True)
+    capture(old, old_day, [fill("c", 5, -7)], False)
+    stable_part, stale_part = parts / "stable", parts / "stale"
+    partition_fills([stable / "fills.parquet"], stable_part)
+    partition_fills([old / "fills.parquet"], stale_part)
+    summarize_partitions([stable_part, stale_part], summaries, start=None, end=T, score_start=T-60*DAY)
+    stable_receipt = stable_part / "receipt.json"
+    stable_before = stable_receipt.read_bytes(), stable_receipt.stat().st_mtime_ns
+    stale_before = (stale_part / "receipt.json").read_bytes()
+    stable_bucket = next(stable_part.glob("bucket=*")).name.split("=")[1]
+    stable_summary = summaries / f"bucket-{int(stable_bucket):03d}" / "summary.parquet"
+    stable_summary_before = stable_summary.stat().st_mtime_ns
+    original_bytes = (old / "fills.parquet").read_bytes()
+
+    label = old_day.date().isoformat()
+    replacement = root / ".replacements" / label / "attempt-00000001" / label
+    capture(replacement, old_day, [fill("y", 4, -7)], True)
+    frozen = runner.freeze(root, analysis, tmp_path / "absent-retry")
+    assert frozen["cohorts"]["no_observed_link"] == ["y"]
+    assert frozen["ledger_replacement"] is None
+    assert (old / "fills.parquet").read_bytes() == original_bytes
+    assert (stable_receipt.read_bytes(), stable_receipt.stat().st_mtime_ns) == stable_before
+    assert stable_summary.stat().st_mtime_ns == stable_summary_before
+    assert any(p.read_bytes() == stale_before
+               for p in (parts / ".superseded").glob("*/receipt.json"))
+    assert len(runner._roots(parts)) == 2
+    assert runner.freeze(root, analysis, tmp_path / "absent-retry") == frozen
+
+
+def test_missing_historical_receipts_produce_inconclusive_report(tmp_path, monkeypatch):
+    from hl_links import pilot_run as runner
+
+    root = tmp_path / "days"
+    root.mkdir()
+    analysis = tmp_path / "analysis"
+
+    def unavailable(*args, **kwargs):
+        raise OSError("fixture provider unavailable")
+
+    monkeypatch.setattr(runner, "acquire_day", unavailable)
+    frozen = runner.freeze(root, analysis, tmp_path / "absent-retry")
+    assert frozen["cohorts"] == {"proven": [], "linked": [], "no_observed_link": [], "links": []}
+    assert len(frozen["history_receipt"]["missing_days"]) == 175
+    assert len(frozen["ledger_receipt"]["missing_days"]) == 60
+    report = runner.evaluate(root, analysis, frozen)
+    assert report["status"] == "inconclusive"
+    assert report["comparison"]["mean_difference"] is None
+    assert runner.sanitized(report)["ledger_replacement_day"] is None
+    first = runner.verify_replay(root, analysis, frozen, report)
+    assert first["outcomes_equal"]
+    prior = (analysis / "verified-v2" / "manifest.json").read_bytes()
+    monkeypatch.setattr(runner, "_code_digest", lambda: "a" * 64)
+    revised = runner.verify_replay(root, analysis, frozen, report)
+    assert revised["outcomes_equal"]
+    assert revised["verification_code_sha256"] == "a" * 64
+    assert revised["frozen_sha256"] == first["frozen_sha256"]
+    assert (analysis / "verified-v2" / "manifest.json").read_bytes() == prior
+    new_receipt = analysis / ("verified-v2-" + "a" * 64) / "manifest.json"
+    assert json.loads(new_receipt.read_text()) == revised
+    assert runner.verify_replay(root, analysis, frozen, report) == revised
+
+
 def test_staged_pilot_freezes_before_provider_and_matches_fixture(tmp_path, monkeypatch):
     from hl_links import pilot_run as runner
 
@@ -276,8 +378,13 @@ def test_staged_pilot_freezes_before_provider_and_matches_fixture(tmp_path, monk
     def provider(path, day, *, analysis):
         assert (analysis / "frozen" / "receipt.json").is_file()
         calls.append(day)
-        return day_snapshot(path / day.date().isoformat(), day,
-                            [r for r in rows if r["event_at"] == day], [])
+        directory = path / day.date().isoformat()
+        metadata = day_snapshot(directory, day, [r for r in rows if r["event_at"] == day], [])
+        if day == T + DAY:
+            metadata["fills"]["intervals"] = []
+            metadata["fills"]["acquisition"]["slices"][0]["coverage_complete"] = False
+            (directory / "metadata.json").write_text(json.dumps(metadata))
+        return metadata
 
     monkeypatch.setattr(runner, "acquire_day", provider)
     frozen = runner.freeze(root, analysis, retry)
@@ -285,6 +392,13 @@ def test_staged_pilot_freezes_before_provider_and_matches_fixture(tmp_path, monk
     assert frozen["cohorts"]["linked"] == ["y"]
     assert frozen["cohorts"]["no_observed_link"] == ["c"]
     assert runner.freeze(root, analysis, retry) == frozen
+    from hl_links import pilot
+    other = tmp_path / "unrelated"
+    other.mkdir()
+    with monkeypatch.context() as patch:
+        patch.setattr(pilot, "_capture_day", lambda *a, **kw: pytest.fail("foreign freeze authorized provider"))
+        with pytest.raises(ValueError, match="run identity"):
+            pilot.acquire_day(other, T, analysis=analysis)
     report = runner.evaluate(root, analysis, frozen)
     assert len(calls) == 30
     assert report["comparison"]["linked"]["mean"] == 10
@@ -296,6 +410,12 @@ def test_staged_pilot_freezes_before_provider_and_matches_fixture(tmp_path, monk
     assert len(calls) == 30
     verification = runner.verify_replay(root, analysis, frozen, report)
     assert verification["cohorts_equal"] and verification["outcomes_equal"]
+    assert runner.verify_replay(root, analysis, frozen, report) == verification
+    # A later complete forward replacement cannot change the published report's lineage.
+    later = T + DAY
+    label = later.date().isoformat()
+    replacement = root / ".replacements" / label / "attempt-00000001" / label
+    day_snapshot(replacement, later, [fill("y", 99, 1, pnl=100)], [])
     assert runner.verify_replay(root, analysis, frozen, report) == verification
     historical = next(iter(frozen["history_receipt"]["days"]))
     source = Path(historical["path"])

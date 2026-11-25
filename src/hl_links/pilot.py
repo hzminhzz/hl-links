@@ -14,6 +14,7 @@ from tempfile import TemporaryDirectory
 import duckdb
 
 from .acquire import Vike, Reservoir, Window, acquire_snapshots, _AGENT
+from .pilot_checkpoints import validate_frozen
 from .resources import SnapshotBudgetExceeded, private_runs_dir
 from .study import PILOT_CUTOFF, _utc
 
@@ -65,9 +66,7 @@ def acquire_day(root, start, *, max_attempts=2, ledger_extra=None, analysis=None
     if start >= PILOT_CUTOFF:
         if analysis is None or not (Path(analysis) / "frozen" / "receipt.json").is_file():
             raise ValueError("Forward acquisition requires a verified historical freeze")
-        from .pilot_run import _load_checkpoint, _validate_frozen
-        analysis = Path(analysis)
-        _validate_frozen(analysis, _load_checkpoint(analysis / "frozen"))
+        validate_frozen(root, Path(analysis))
     if not 1 <= max_attempts <= 2:
         raise ValueError("Invalid day attempt budget")
     needs_ledger = LEDGER_START <= start < PILOT_CUTOFF

@@ -168,9 +168,9 @@ A present manifest is not proof that the underlying data still matches it. Run t
 | Existing freeze with newly recovered historical data | Preserve the freeze. Any materially changed historical population requires a separately declared analysis revision, never a silent refreeze. |
 | Existing final report with newly recovered forward data | Preserve the published report and its input lineage. A changed input set requires a separate analysis revision; there is no automatic final-report overwrite command. |
 
-The checkpoint runner is intentionally fail-closed on conflicting completed partition inputs. If a partial daily receipt was already partitioned and a replacement changes that input, do not force the old partition set to accept it. Plan a new, isolated analysis revision for the affected data. Preserve the original artifacts.
+Before publishing a historical freeze or final report, the runner can recover a known incomplete input using its complete immutable replacement. It retains superseded partition batches and summaries under `.superseded/`, rebuilds only affected batches and identity buckets, and reuses unaffected checkpoints. Unexpected source changes, duplicate input identities, checksum mismatches and incompatible queries still fail closed. Missing historical coverage is reported explicitly; a missing September 8 original receipt is not a mandatory prerequisite. Once a freeze or final report exists, its selected inputs are immutable.
 
-New partition receipts bind DuckDB version, identity SQL and the hash algorithm. For old receipts the validation reads the real shard assignments; this can cost I/O but avoids unnecessary repartitioning. Fresh verification also checks the source/metadata hashes, partition receipt lineage, summary requests and hashes, historical cohort membership, representative transfer and fill audits, and reconstructed outcome/diagnostics. A prior verification receipt is reused only after the fresh checks pass.
+New partition receipts bind DuckDB version, identity SQL and the hash algorithm. For old receipts the validation reads the real shard assignments; this can cost I/O but avoids unnecessary repartitioning. Fresh verification also checks the source/metadata hashes, partition receipt lineage, summary requests and hashes, historical cohort membership, representative transfer and fill audits, and reconstructed outcome/diagnostics. Legacy validation and representative audits use the standard private DuckDB spill and disk budget. A prior verification receipt is reused only after the fresh checks pass. Later compatible code revisions produce separate `verified-v2-<code-sha256>/` and `sanitized-v2-<code-sha256>/` receipts. The original frozen population and final report are not rewritten. Replay uses the published forward input selection, not newly available replacements.
 
 ## 6. Artifacts and interpretation
 
@@ -188,7 +188,7 @@ All runtime artifacts stay under ignored `runs/`:
 | `runs/t03-analysis/verified-v2/manifest.json` | Hardened verification receipt. |
 | `runs/t03-analysis/sanitized-v2/manifest.json` | Aggregate report with group statistics, coverage, limitations and verification. |
 
-Older `verified/` and `sanitized/` directories may exist if the reviewed predecessor completed the pilot. Preserve them; they are not substitutes for the hardened v2 verification.
+Older `verified/` and `sanitized/` directories may exist if the reviewed predecessor completed the pilot. Preserve them; they are not substitutes for the hardened v2 verification. Preserve versioned v2 receipts as well; select the receipt matching the current verifier code digest when inspecting the newest replay.
 
 After successful verification, inspect only the aggregate artifact for sharing:
 

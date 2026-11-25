@@ -9,16 +9,19 @@ import math
 from pathlib import Path
 from tempfile import TemporaryDirectory
 
-import duckdb
 
 from .cohorts import make_cohorts
 from .fills import FillArchive
-from .pilot import ARCHIVE_START, LEDGER_START, FORWARD_END, acquire_day, complete_day, select_day
+from .pilot import ARCHIVE_START, LEDGER_START, FORWARD_END, acquire_day, complete_day, day_candidates, select_day
 from .pilot_analysis import (
     _write_json, partition_fills, summarize_partitions, verify_partitioned_ledger,
-    wallet_digest,
+    archive_checkpoint, wallet_digest,
 )
-from .resources import SnapshotBudgetExceeded, private_runs_dir
+from .pilot_checkpoints import (
+    load_checkpoint as _load_checkpoint, research_semantics, run_identity,
+    validate_frozen, verification_directory,
+)
+from .resources import SnapshotBudgetExceeded, bounded_duckdb, private_runs_dir
 from .study import (
     DAY, PILOT_CUTOFF as T, _code_digest, _gaps, _json_default, _sha256, _utc,
     _wallet_records, assemble_report,
@@ -45,28 +48,39 @@ def _roots(path):
 
 def daily_receipt(root, name, start, end, *, replacements=None):
     """Bind actual snapshots, metadata and coverage to the declared UTC days."""
-    records, intervals, missing = [], [], []
+    records = []
     replacements = replacements or {}
     for day in _days(start, end):
         label = day.date().isoformat()
         selected = select_day(root, day, name, extra=replacements.get(label))
         if selected is None:
-            missing.append(label)
             continue
         directory, declaration = selected
         path, meta = directory / f"{name}.parquet", directory / "metadata.json"
-        declared = [tuple(map(_utc, pair)) for pair in declaration["intervals"]]
-        if any(not day <= left < right <= day + DAY for left, right in declared):
-            raise ValueError("Daily coverage outside requested UTC day")
-        intervals.extend(declared)
         records.append({
             "day": label, "path": str(path), "sha256": _sha256(path),
             "metadata_sha256": _sha256(meta), "declaration": declaration,
         })
+    return _receipt_from_days(records, start, end)
+
+
+def _receipt_from_days(records, start, end):
+    intervals, seen = [], set()
+    for item in records:
+        day = _utc(item["day"] + "T00:00:00Z")
+        if not start <= day < end or day in seen:
+            raise ValueError("Daily receipt outside frozen interval or duplicated")
+        seen.add(day)
+        declared = [tuple(map(_utc, pair)) for pair in item["declaration"]["intervals"]]
+        if any(not day <= left < right <= day + DAY for left, right in declared):
+            raise ValueError("Daily coverage outside requested UTC day")
+        intervals.extend(declared)
+    digest = _digest(records) if records else None
     return {
         "present": bool(records), "source": "daily normalized provider snapshots" if records else None,
-        "retrieval_id": _digest(records) if records else None, "sha256": _digest(records) if records else None,
-        "declared_intervals": sorted(set(intervals)), "days": records, "missing_days": missing,
+        "retrieval_id": digest, "sha256": digest,
+        "declared_intervals": sorted(set(intervals)), "days": records,
+        "missing_days": [day.date().isoformat() for day in _days(start, end) if day not in seen],
     }
 
 
@@ -92,8 +106,60 @@ def _validate_partition_set(receipt, directories, *, wallets=None, allow_missing
     return missing
 
 
-def partition_days(receipt, root, *, wallets=None):
-    """Resume disjoint completed batches, refusing changed or duplicated input."""
+def _replacement_inputs(receipt, record, source_root, name, *, extra=None):
+    """Only a complete receipt replacing a known incomplete day permits retirement."""
+    selected = {Path(item["path"]).resolve(): item for item in receipt["days"]}
+    by_day = {item["day"]: item for item in receipt["days"]}
+    replaced = False
+    seen = set()
+    for item in record["inputs"]:
+        path = Path(item["path"]).resolve()
+        if path in seen:
+            raise ValueError("Duplicate partition source")
+        seen.add(path)
+        if path in selected:
+            if selected[path]["sha256"] != item["sha256"]:
+                raise ValueError("Partition checkpoint input mismatch")
+            continue
+        label = "2026-09-08" if extra is not None and path.parent == extra.resolve() else path.parent.name
+        replacement = by_day.get(label)
+        candidates = day_candidates(source_root, label, extra=extra if label == "2026-09-08" else None)
+        if (replacement is None or path not in {p.resolve() / f"{name}.parquet" for p in candidates}
+                or _sha256(path) != item["sha256"]):
+            raise ValueError("Partition checkpoint input mismatch")
+        day = _utc(label + "T00:00:00Z")
+        old = json.loads((path.parent / "metadata.json").read_text())[name]
+        if complete_day(old, day, name) or not complete_day(replacement["declaration"], day, name):
+            raise ValueError("Partition checkpoint input mismatch")
+        replaced = True
+    return replaced
+
+
+def _archive_partition(directory, record):
+    for item in record["shards"]:
+        path = directory / item["path"]
+        if not path.resolve().is_relative_to(directory.resolve()) or _sha256(path) != item["sha256"]:
+            raise ValueError("Partition shard checksum mismatch")
+    archive_checkpoint(directory)
+
+
+def partition_days(receipt, root, *, wallets=None, source_root=None):
+    """Resume unchanged batches and retain superseded incomplete batches privately."""
+    if source_root is not None:
+        stale, seen = [], set()
+        for directory in _roots(root):
+            record = json.loads((directory / "receipt.json").read_text())
+            if record["buckets"] != 64 or record.get("wallets_sha256") != wallet_digest(wallets):
+                raise ValueError("Unexpected fill partition configuration")
+            for item in record["inputs"]:
+                path = Path(item["path"]).resolve()
+                if path in seen:
+                    raise ValueError("Duplicate partition source")
+                seen.add(path)
+            if _replacement_inputs(receipt, record, source_root, "fills"):
+                stale.append((directory, record))
+        for directory, record in stale:
+            _archive_partition(directory, record)
     missing = _validate_partition_set(receipt, _roots(root), wallets=wallets, allow_missing=True)
     for offset in range(0, len(missing), 4):
         batch = missing[offset:offset + 4]
@@ -130,8 +196,7 @@ def _audit_edges(paths, cohorts):
     sample = sorted(links, key=lambda row: row["transaction_id"])[:24]
     if not sample:
         return {"sampled": 0, "matched": 0}
-    with duckdb.connect() as con:
-        con.execute("SET TimeZone = 'UTC'")
+    with bounded_duckdb() as con:
         rows = con.execute("""
             SELECT transaction_id, wallet, counterparty, direction, transfer_type,
                    event_at, amount_usd, token, signed_amount_usd, intermediary,
@@ -164,8 +229,9 @@ def _audit_edges(paths, cohorts):
 def _audit_fills(paths):
     """Independent arithmetic and interval checks on actual normalized rows."""
     sampled = failures = 0
-    with duckdb.connect() as con:
-        con.execute("SET TimeZone = 'UTC'")
+    if not paths:
+        return {"sampled": 0, "failed": 0, "days": []}
+    with bounded_duckdb() as con:
         for path in paths:
             day = _utc(path.parent.name + "T00:00:00Z")
             rows = con.execute("""
@@ -197,62 +263,16 @@ def _checkpoint(directory, value):
         target.rename(directory)
 
 
-def _load_checkpoint(directory):
-    path = directory / "manifest.json"
-    receipt = json.loads((directory / "receipt.json").read_text())
-    if _sha256(path) != receipt["sha256"]:
-        raise ValueError("Checkpoint checksum mismatch")
-    return json.loads(path.read_text())
-
-
-# One explicitly reviewed predecessor can be resumed without refreezing.
-# The research and acquisition semantics must remain byte-identical.
-_REVIEWED_CODE = "ed3565187e24756b6d9834b4ef66c3c9153f2e2f9fbb4518944385ee16a7d5c8"
-_REVIEWED_SEMANTICS = {
-    "fills.py": "17d0efbf5587b706f6e7a8fb073881519340d8fcde5881c72db098e6fec15861",
-    "ledger.py": "bebbbfea1402737e5d575012b937187cc3a96f2728da48381623690c3cfe10c0",
-    "cohorts.py": "50d4caf2075decf1027cdc06addf7ae71a089003790559e7fc879346db91fb8e",
-    "study.py": "058ed9e1ced305b37b59eaff0a0e344cdffb838e5a725f6b7d8f32e22efed95d",
-    "acquire.py": "1349d89ea7fa9eece5b153d250b7d70bdac5aeae138336690530174b9383c782",
-}
-
-
-def _validate_frozen(analysis, frozen):
-    if frozen != _load_checkpoint(analysis / "frozen") or _utc(frozen["cutoff"]) != T:
-        raise ValueError("Frozen historical checkpoint changed")
-    if frozen["code_sha256"] == _code_digest():
-        return
-    if frozen["code_sha256"] != _REVIEWED_CODE or any(
-        _sha256(Path(__file__).with_name(name)) != digest
-        for name, digest in _REVIEWED_SEMANTICS.items()
-    ):
-        raise ValueError("Frozen pilot code changed; do not silently refreeze")
-
-
 def _validate_daily_inputs(receipt, name, start, end):
-    seen = set()
-    intervals = []
+    expected = _canonical(_receipt_from_days(receipt["days"], start, end))
+    if any(receipt[key] != value for key, value in expected.items()):
+        raise ValueError("Daily receipt aggregate mismatch")
     for item in receipt["days"]:
-        day = _utc(item["day"] + "T00:00:00Z")
-        if not start <= day < end or day in seen:
-            raise ValueError("Daily receipt outside frozen interval or duplicated")
-        seen.add(day)
         path = Path(item["path"])
         meta = path.parent / "metadata.json"
         if (_sha256(path) != item["sha256"] or _sha256(meta) != item["metadata_sha256"]
                 or json.loads(meta.read_text())[name] != item["declaration"]):
             raise ValueError("Historical or forward input checksum mismatch")
-        for pair in item["declaration"]["intervals"]:
-            left, right = map(_utc, pair)
-            if not day <= left < right <= day + DAY:
-                raise ValueError("Daily receipt coverage outside window")
-            intervals.append((left, right))
-    if (_canonical(sorted(set(intervals))) != receipt["declared_intervals"]
-            or receipt["present"] != bool(seen)
-            or receipt["missing_days"] != [d.date().isoformat() for d in _days(start, end) if d not in seen]
-            or receipt["sha256"] != (_digest(receipt["days"]) if seen else None)
-            or receipt["retrieval_id"] != receipt["sha256"]):
-        raise ValueError("Daily receipt aggregate mismatch")
 
 
 def _historical_roots(frozen):
@@ -269,9 +289,7 @@ def _historical_roots(frozen):
 def freeze(root, analysis, retry):
     directory = analysis / "frozen"
     if directory.exists():
-        frozen = _load_checkpoint(directory)
-        _validate_frozen(analysis, frozen)
-        return frozen
+        return validate_frozen(root, analysis, code_sha256=_code_digest())
     # Recover existing incomplete days before partitioning or freezing. Missing
     # days remain explicit gaps if standalone historical acquisition failed.
     for day in _days(ARCHIVE_START, T):
@@ -287,21 +305,42 @@ def freeze(root, analysis, retry):
     history_receipt["archive_start"] = ARCHIVE_START
     history_receipt["historical_gaps"] = _gaps(history_receipt, ARCHIVE_START, T)
     ledger_receipt["historical_gaps"] = _gaps(ledger_receipt, LEDGER_START, T)
-    history_roots = partition_days(history_receipt, analysis / "history-parts")
+    history_roots = partition_days(history_receipt, analysis / "history-parts", source_root=root)
     print("historical partitions validated", len(history_roots), flush=True)
     history, counts = summarize_partitions(
-        history_roots, analysis / "history-summary", start=None, end=T, score_start=LEDGER_START)
-    cohorts, ledger_counts = freeze_cohorts(history, _paths(ledger_receipt), analysis / "ledger-parts")
-    with FillArchive(_paths(history_receipt)) as archive:
-        input_counts = archive.input_diagnostics(forward_start=T, forward_end=FORWARD_END)
+        history_roots, analysis / "history-summary", start=None, end=T, score_start=LEDGER_START,
+        resume_updates=True)
+    ledger_parts = analysis / "ledger-parts"
+    if ledger_parts.exists():
+        record = json.loads((ledger_parts / "receipt.json").read_text())
+        if record["buckets"] != 32 or record.get("wallets_sha256") is not None:
+            raise ValueError("Unexpected ledger partition configuration")
+        replaced = _replacement_inputs(ledger_receipt, record, root, "ledger", extra=retry)
+        if replaced or len(record["inputs"]) != len(ledger_receipt["days"]):
+            _archive_partition(ledger_parts, record)
+    cohorts, ledger_counts = freeze_cohorts(history, _paths(ledger_receipt), ledger_parts)
+    input_counts = {"invalid_event_time_rows": 0, "forward_invalid_wallet_rows": 0}
+    if _paths(history_receipt):
+        with FillArchive(_paths(history_receipt)) as archive:
+            input_counts = archive.input_diagnostics(forward_start=T, forward_end=FORWARD_END)
     sample = [p for p in _paths(history_receipt) if p.parent.name in
               {"2026-05-01", "2026-08-24", "2026-10-22"}]
+    original = root / "2026-09-08"
+    replacement = None
+    if any(Path(item["path"]).parent.resolve() == retry.resolve()
+           for item in ledger_receipt["days"]):
+        replacement = {
+            "day": "2026-09-08",
+            "original_metadata_sha256": _sha256(original / "metadata.json")
+            if (original / "metadata.json").is_file() else None,
+            "original_ledger_sha256": _sha256(original / "ledger.parquet")
+            if (original / "ledger.parquet").is_file() else None,
+        }
     frozen = {
         "cutoff": T, "frozen_at": datetime.now(timezone.utc), "code_sha256": _code_digest(),
+        "run_identity": run_identity(root, analysis), "research_semantics": research_semantics(),
         "history_receipt": history_receipt, "ledger_receipt": ledger_receipt,
-        "ledger_replacement": {"day": "2026-09-08",
-                               "original_metadata_sha256": _sha256(root / "2026-09-08" / "metadata.json"),
-                               "original_ledger_sha256": _sha256(root / "2026-09-08" / "ledger.parquet")},
+        "ledger_replacement": replacement,
         "history_partitions": [{"path": str(p), "receipt_sha256": _sha256(p / "receipt.json")}
                                for p in history_roots],
         "history_counts": counts, "ledger_counts": ledger_counts, "fill_input_counts": input_counts,
@@ -347,7 +386,7 @@ def evaluate(root, analysis, frozen):
     directory = analysis / "final"
     # A durable, checksum-verified historical freeze is mandatory before any
     # forward provider request. Never select cohorts from forward records.
-    _validate_frozen(analysis, frozen)
+    validate_frozen(root, analysis, frozen, code_sha256=_code_digest())
     if directory.exists():
         report = _load_checkpoint(directory)
         if report["manifest"]["frozen_checkpoint_sha256"] != _sha256(analysis / "frozen" / "manifest.json"):
@@ -370,9 +409,10 @@ def evaluate(root, analysis, frozen):
     receipt["forward_gaps"] = _gaps(receipt, T, FORWARD_END)
     receipt = _canonical(receipt)
     eligible = sorted(frozen["cohorts"]["linked"] + frozen["cohorts"]["no_observed_link"])
-    forward_roots = partition_days(receipt, analysis / "forward-parts", wallets=eligible)
+    forward_roots = partition_days(receipt, analysis / "forward-parts", wallets=eligible, source_root=root)
     forward, counts = summarize_partitions(history_roots + forward_roots, analysis / "forward-summary",
-                                            start=T, end=FORWARD_END, score_start=T, wallets=eligible)
+                                            start=T, end=FORWARD_END, score_start=T, wallets=eligible,
+                                            resume_updates=True)
     input_counts = dict(frozen["fill_input_counts"])
     if _paths(receipt):
         with FillArchive(_paths(receipt)) as archive:
@@ -397,8 +437,9 @@ def evaluate(root, analysis, frozen):
 
 def verify_replay(root, analysis, frozen, report):
     """Reconstruct membership and outcomes from verified private checkpoints."""
-    directory = analysis / "verified-v2"
-    _validate_frozen(analysis, frozen)
+    code_sha256 = _code_digest()
+    directory = verification_directory(analysis, code_sha256)
+    validate_frozen(root, analysis, frozen, code_sha256=code_sha256)
     if report != _load_checkpoint(analysis / "final"):
         raise ValueError("Final report checkpoint changed")
     report_hash = _sha256(analysis / "final" / "manifest.json")
@@ -426,9 +467,11 @@ def verify_replay(root, analysis, frozen, report):
                          {"2026-05-01", "2026-08-24", "2026-10-22"}]
     if _audit_fills(historical_sample) != frozen["historical_fill_audit"]:
         raise ValueError("Historical fill audit replay mismatch")
-    receipt = daily_receipt(root, "fills", T, FORWARD_END)
+    # Replay the published input selection, not subsequently recovered days.
+    receipt = _receipt_from_days(report["manifest"]["inputs"]["fills"]["forward_days"], T, FORWARD_END)
     receipt["forward_gaps"] = _gaps(receipt, T, FORWARD_END)
     receipt = _canonical(receipt)
+    _validate_daily_inputs(receipt, "fills", T, FORWARD_END)
     eligible = sorted(cohorts["linked"] + cohorts["no_observed_link"])
     forward_roots = _roots(analysis / "forward-parts")
     _validate_partition_set(receipt, forward_roots, wallets=eligible)
@@ -459,7 +502,7 @@ def verify_replay(root, analysis, frozen, report):
     verification = {
         "report_sha256": report_hash,
         "frozen_sha256": frozen_hash,
-        "verification_code_sha256": _code_digest(),
+        "verification_code_sha256": code_sha256,
         "method": "fresh input, partition and summary checksums; repeated ledger verification and cohort and outcome reconstruction",
         "historical_summary_shards": len(_roots(analysis / "history-summary")),
         "forward_summary_shards": len(_roots(analysis / "forward-summary")),
@@ -512,7 +555,8 @@ def sanitized(report):
     result["acquisition"] = acquisition
     result["coverage"] = {key: {k: v for k, v in value.items() if k.endswith("_gaps")}
                           for key, value in manifest["inputs"].items()}
-    result["ledger_replacement_day"] = manifest["ledger_replacement"]["day"]
+    replacement = manifest["ledger_replacement"]
+    result["ledger_replacement_day"] = replacement["day"] if replacement else None
     for group in ("linked", "no_observed_link"):
         stats = result["comparison"][group]
         if stats["valid"] >= 2:
@@ -544,7 +588,8 @@ def main(argv=None):
     verification = verify_replay(args.root, args.analysis, frozen, report)
     result = sanitized(report)
     result["verification"] = verification
-    public = args.analysis / "sanitized-v2"
+    verified = verification_directory(args.analysis, verification["verification_code_sha256"])
+    public = verified.with_name(verified.name.replace("verified-", "sanitized-", 1))
     if public.exists():
         if _load_checkpoint(public) != _canonical(result):
             raise ValueError("Sanitized report replay mismatch")
