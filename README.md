@@ -2,6 +2,8 @@
 
 Independent, read-only Hyperliquid wallet-relationship research.
 
+**Operator documentation:** [T03 how-to and recovery guide](docs/t03-operator-guide.md) · [Changelog](CHANGELOG.md) · [MVP specification](docs/spec-mvp.md). For an existing pilot, follow the operator guide before updating the checkout or running any acquisition command.
+
 ## Objective
 
 Test whether newly active Hyperliquid wallets with a **verified pre-cutoff funding link** to a historically profitable trader outperform comparable unlinked wallets over a subsequent 30-day window. Treat this as a falsifiable hypothesis, not a trading signal.
