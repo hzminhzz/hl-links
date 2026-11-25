@@ -143,4 +143,4 @@ The private analysis directory contains historical and forward partition receipt
 
 If a pilot is already executing at the reviewed T03 commit `44482f07ec587c7b7a89951b23ecb52450067a93`, let its single writer reach a durable checkpoint or exit before updating the checkout. Resume from the same project directory and private paths. The reviewed freeze can be replayed by the hardened runner only while the acquisition and economic modules retain the pinned content digests; the historical freeze is not regenerated.
 
-**State:** T01 provides the deterministic study runner; T02 connects historical vendors and demonstrates a bounded real-data run. T03 requires actual pilot results, not just passing fixture tests. All findings remain exploratory; no trading authorization or production integration.
+**State:** T01 provides the deterministic study runner; T02 connects historical vendors and demonstrates a bounded real-data run. T03 completed its real-data pilot and hardened reproducibility replay on November 25, 2026. See [T03 pilot results](docs/t03-pilot-results.md). The scientific comparison is partial/inconclusive; no trading authorization or production integration.

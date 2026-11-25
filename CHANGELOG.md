@@ -23,7 +23,7 @@ Implementation: `10b343bfbd473c44cf89de473caaccc344cd3cc6`.
 ### Verification
 
 - 90/90 regression tests passed at the hardening commit; `git diff --check` passed.
-- Real-data pilot acceptance remains separate. Do not treat deterministic regression success as a completed research result.
+- The real-data pilot and hardened replay completed successfully on 2026-11-25. Cohort membership, outcomes and diagnostics matched; the research conclusion remains partial/inconclusive. See [T03 pilot results](docs/t03-pilot-results.md).
 - No production changes, branch merge, trading authorization or scientific qualification.
 
 ## T03 — Resumable pilot runner (2026-11-24)
